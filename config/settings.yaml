@@ -9,6 +9,8 @@ broker:
   symbols: [SPY, QQQ, AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, AMD]
   # Bar timeframe used for features, HMM fitting, and rebalancing (Alpaca TimeFrame string).
   timeframe: 1Day
+  # Completed live bars; model training continues to use daily history.
+  live_timeframe: 5Min
 
 hmm:
   # The HMM is a volatility classifier (calm/moderate/turbulent), not a direction forecaster.

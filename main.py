@@ -1,4 +1,4 @@
-"""Offline simulation entry point; historical downloading is explicitly requested by CLI."""
+"""Trading, training and offline research entry points; imports never connect."""
 from __future__ import annotations
 import argparse
 from pathlib import Path
@@ -13,7 +13,11 @@ def load_config(path=DEFAULT_CONFIG):
 
 def parse_args(argv=None):
     parser=argparse.ArgumentParser()
-    parser.add_argument('mode',choices=['backtest','stress'])
+    parser.add_argument('mode', nargs='?', default='live', choices=['live','train-only','backtest','stress'])
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument('--backtest', action='store_true')
+    modes.add_argument('--train-only', action='store_true')
+    parser.add_argument('--dry-run', action='store_true')
     parser.add_argument('--config',type=Path,default=DEFAULT_CONFIG)
     parser.add_argument('--symbols',nargs='+')
     parser.add_argument('--start',default='2019-01-01')
@@ -69,9 +73,68 @@ def run_backtest(config,args=None):
 def run_stress(config):
     return run_backtest(config,parse_args(['stress']))
 
+def build_live_loop(config, *, dry_run=False):
+    """Construct lazy adapters; connect only on explicit execution."""
+    from datetime import datetime, timedelta, timezone
+    from broker.alpaca_client import AlpacaClient
+    from broker.order_executor import OrderExecutor
+    from broker.position_tracker import PositionTracker
+    from data.market_data import MarketDataFeed
+    from data.feature_engineering import FeatureEngineer, FeatureConfig
+    from core.hmm_engine import HMMEngine, HMMConfig
+    from core.regime_strategies import StrategyOrchestrator, StrategyConfig
+    from core.risk_manager import RiskManager, RiskConfig, PortfolioState
+    from core.trading_loop import TradingLoop, retry_api
+    from monitoring.dashboard import Dashboard
+    from monitoring.alerts import AlertManager
+    import time
+
+    client = AlpacaClient(config['broker'])
+    symbols = config['broker']['symbols']
+    feed = MarketDataFeed(client, symbols, config['broker'].get('live_timeframe', '5Min'))
+    features = FeatureEngineer(FeatureConfig.from_dict(config.get('features')))
+    engine = HMMEngine(HMMConfig.from_dict(config.get('hmm')))
+    risk = RiskManager(RiskConfig.from_dict(config['risk']))
+    portfolio = PortfolioState(0, 0, 0)
+    tracker = PositionTracker(client, risk, portfolio)
+    strategy = StrategyOrchestrator(StrategyConfig.from_dict(config.get('strategy'), config.get('hmm')))
+
+    def train(model):
+        end = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        daily = MarketDataFeed(client, symbols, '1Day')
+        bars = retry_api(lambda: daily.get_history(end-timedelta(days=2000), end), time.sleep)
+        source = bars[symbols[0]]
+        matrix = features.build_features(source)
+        model.fit(matrix, features.returns(source).reindex(matrix.index))
+
+    def warm_history():
+        end = datetime.now(timezone.utc)
+        history = feed.get_history(end-timedelta(days=30), end)
+        # REST timestamps denote interval starts; omit the currently forming interval.
+        import pandas as pd
+        cutoff = pd.Timestamp(end).floor(config['broker'].get('live_timeframe', '5Min').replace('Min', 'min'))
+        return {s: b.loc[b.index < cutoff] for s, b in history.items()}
+
+    return TradingLoop(config, client=client, feed=feed, engine=engine, features=features,
+                       strategy=strategy, risk=risk, tracker=tracker,
+                       executor=OrderExecutor(client, risk, portfolio), dashboard=Dashboard(),
+                       alerts=AlertManager(), train=train, dry_run=dry_run, warm_history=warm_history)
+
+
 def main(argv=None):
     args=parse_args(argv)
-    run_backtest(load_config(args.config),args)
+    config = load_config(args.config)
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    if args.train_only or args.mode == 'train-only':
+        loop = build_live_loop(config, dry_run=True)
+        loop.read(loop.client.connect)
+        loop.train(loop.engine)
+        loop.engine.save(loop.model_path)
+    elif args.backtest or args.mode in ('backtest', 'stress') or args.stress_test or args.compare:
+        run_backtest(config, args)
+    else:
+        build_live_loop(config, dry_run=args.dry_run).run()
     return 0
 
 if __name__=='__main__':
