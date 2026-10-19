@@ -96,30 +96,74 @@ strategy:
   high_vol_rank_cutoff: 0.67
 
 risk:
-  # Max fraction of equity risked on a single trade (stop-distance based sizing).
+  # The risk manager is independent of the HMM and has absolute veto over every signal.
+  # Max fraction of equity risked on a single trade: size = equity * this / |entry - stop|.
   max_risk_per_trade: 0.01
-  # Max gross exposure as a fraction of equity (before leverage allowance).
+  # Max gross exposure as a fraction of equity at 1.0x (20% cash minimum); the cap is
+  # max_exposure * allowed leverage, so 1.25x permits 100% gross.
   max_exposure: 0.80
-  # Hard cap on gross leverage.
+  # Hard cap on portfolio leverage; only confident low-vol signals may use it.
   max_leverage: 1.25
+  # Leverage used whenever the low-vol conditions are not all met.
+  default_leverage: 1.0
   # Max weight of any single position.
   max_single_position: 0.15
+  # Max combined weight of positions in one sector (see sectors below).
+  max_sector_exposure: 0.30
   # Max number of concurrently open positions.
   max_concurrent: 5
   # Max number of orders submitted per trading day.
   max_daily_trades: 20
-  # Daily drawdown at which exposure is reduced.
+  # Circuit breakers on actual P&L (thresholds are exceeded strictly, i.e. dd > value).
+  # Daily drawdown: reduce all sizes by reduce_size_mult for the rest of the day.
   daily_dd_reduce: 0.02
-  # Daily drawdown at which new trading is halted for the day.
+  # Daily drawdown: close all positions and halt for the rest of the day.
   daily_dd_halt: 0.03
-  # Weekly drawdown at which exposure is reduced.
+  # Weekly drawdown: reduce all sizes for the rest of the week.
   weekly_dd_reduce: 0.05
-  # Weekly drawdown at which new trading is halted for the week.
+  # Weekly drawdown: close all positions and halt for the rest of the week.
   weekly_dd_halt: 0.07
-  # Drawdown from equity peak that triggers full de-risking / kill switch.
+  # Drawdown from equity peak: close all, halt, and write lock_file (delete it manually to resume).
   max_dd_from_peak: 0.10
-  # Target-allocation multiplier while in the REDUCED state (daily/weekly reduce thresholds).
+  # Size multiplier while a reduce breaker is active.
   reduce_size_mult: 0.50
+  # Lock file written by the peak-drawdown breaker (relative to the working directory).
+  lock_file: trading_halted.lock
+  # Positions smaller than this (account currency) are rejected.
+  min_position_value: 100
+  # Overnight gap risk: a gap of gap_stop_multiple x stop distance may lose at most max_gap_loss of equity.
+  gap_stop_multiple: 3.0
+  max_gap_loss: 0.02
+  # Reject orders when (ask - bid) / mid >= this.
+  max_spread_pct: 0.005
+  # Same symbol + direction within this many seconds is a duplicate.
+  duplicate_window_seconds: 60
+  # Rolling correlation with held positions: reduce size above correlation_reduce, reject above correlation_reject.
+  correlation_window: 60
+  correlation_reduce: 0.70
+  correlation_reject: 0.85
+  correlation_reduce_mult: 0.50
+  # Leverage is forced to default_leverage with this many or more open positions.
+  leverage_max_positions: 3
+  # Leverage is forced to default_leverage when the regime flicker rate exceeds this.
+  max_flicker_rate: 4
+  # Max single-position weight by volatility regime (signal metadata vol_regime).
+  regime_max_position:
+    low: 0.15
+    mid: 0.15
+    high: 0.10
+  # Symbol -> sector for the sector exposure cap; unlisted symbols form their own sector.
+  sectors:
+    SPY: broad_market
+    QQQ: broad_market
+    AAPL: technology
+    MSFT: technology
+    NVDA: technology
+    AMD: technology
+    GOOGL: communication_services
+    META: communication_services
+    AMZN: consumer_discretionary
+    TSLA: consumer_discretionary
 
 backtest:
   # Slippage per rebalance as a fraction of traded notional.

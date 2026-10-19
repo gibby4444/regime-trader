@@ -38,3 +38,6 @@ data/cache/
 .vscode/
 .idea/
 .DS_Store
+
+# Risk manager peak-drawdown lock (delete manually to resume trading)
+trading_halted.lock
