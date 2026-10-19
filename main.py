@@ -15,6 +15,8 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -26,8 +28,23 @@ DEFAULT_CONFIG = Path(__file__).parent / "config" / "settings.yaml"
 DEFAULT_CREDENTIALS = Path(__file__).parent / "config" / "credentials.yaml"
 # Calendar days fetched before --start for feature warm-up (200-bar SMA + 252-bar z-score ~ 451 bars).
 WARMUP_CALENDAR_DAYS = 700
+RISK_LOGGER = "regime_trader.risk"
 
 logger = logging.getLogger("regime_trader")
+
+
+@contextmanager
+def quiet_loggers(*names: str, level: int = logging.ERROR) -> Iterator[None]:
+    """Temporarily raise the level of the named loggers."""
+    loggers = [logging.getLogger(n) for n in names]
+    saved = [lg.level for lg in loggers]
+    for lg in loggers:
+        lg.setLevel(level)
+    try:
+        yield
+    finally:
+        for lg, lvl in zip(loggers, saved):
+            lg.setLevel(lvl)
 
 
 def load_config(path: Path = DEFAULT_CONFIG) -> dict[str, Any]:
@@ -128,7 +145,9 @@ def run_backtest(config: dict[str, Any], args: argparse.Namespace | None = None)
     bt = WalkForwardBacktester.from_settings(config)
     console.print(f"[bold]Walk-forward backtest[/bold] {list(bars)} "
                   f"IS={bt.config.train_window} OOS={bt.config.test_window} step={bt.config.step_size}")
-    result = bt.run(bars, start=args.start, end=args.end)
+    # Per-bar risk rejections/breakers go to risk_rejections.csv / risk_events.csv instead.
+    with quiet_loggers(RISK_LOGGER):
+        result = bt.run(bars, start=args.start, end=args.end)
     for i, f in enumerate(result.folds):
         console.print(f"  window {i}: IS {f.train_start.date()}..{f.train_end.date()} "
                       f"OOS {f.test_start.date()}..{f.test_end.date()} n_states={f.n_states}")
@@ -136,22 +155,22 @@ def run_backtest(config: dict[str, Any], args: argparse.Namespace | None = None)
     report = PerformanceReport.from_result(result, bt.config.risk_free_rate)
     out: dict[str, Any] = {"result": result, "report": report}
     if args.compare:
-        report.benchmarks = compare_benchmarks(
-            result, bars, bt.config, bt.risk_config, n_random=args.n_sims, seed=args.seed
-        )
+        with quiet_loggers(RISK_LOGGER):
+            report.benchmarks = compare_benchmarks(
+                result, bars, bt.config, bt.risk_config, n_random=args.n_sims, seed=args.seed
+            )
     report.print_summary(console)
+    rej, ev = result.risk_rejections, result.risk_events
+    console.print(f"Risk manager: {len(ev)} circuit-breaker events, {len(rej)} rejections"
+                  + (f" ({rej['reason'].value_counts().to_dict()})" if len(rej) else ""))
     paths = report.to_csv(result, args.output_dir)
     out["paths"] = paths
 
     if args.stress_test:
         tester = StressTester(bt, seed=args.seed, n_sims=args.n_sims)
-        hmm_logger = logging.getLogger("regime_trader.hmm")
-        level = hmm_logger.level
-        hmm_logger.setLevel(logging.ERROR)  # injected shocks routinely produce zero-likelihood bars
-        try:
+        # Injected shocks routinely produce zero-likelihood bars and breaker trips.
+        with quiet_loggers("regime_trader.hmm", RISK_LOGGER):
             outcomes = tester.run_all(bars, baseline=result, start=args.start, end=args.end)
-        finally:
-            hmm_logger.setLevel(level)
         table = summarize(outcomes, result)
         from backtest.performance import _frame_table
 

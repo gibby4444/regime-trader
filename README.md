@@ -4,7 +4,7 @@ Volatility-regime allocation trader for US equities on Alpaca. A Gaussian HMM
 detects market regimes; each regime maps to a target allocation/leverage; a risk
 manager enforces sizing, exposure, and drawdown limits before orders are sent.
 
-> Status: HMM engine, strategies, features, risk drawdown states, and the
+> Status: HMM engine, strategies, features, the risk manager, and the
 > walk-forward backtester (performance, benchmarks, stress tests) are implemented.
 > Live trading, order execution and position tracking are still stubs.
 
@@ -58,5 +58,12 @@ History before `--start` is fetched for feature warm-up only.
 - **Regime hygiene:** a regime must persist `stability_bars`; frequent switching
   (`flicker_threshold` within `flicker_window`) or low confidence scales size by
   `uncertainty_size_mult`.
-- **Risk layering:** per-trade risk, per-position cap, gross exposure/leverage cap,
-  daily/weekly reduce & halt thresholds, and a peak-drawdown kill switch.
+- **Risk layering:** `core/risk_manager.py` is independent of the HMM and has
+  absolute veto over every signal (backtest included): stop-loss required, 1%
+  risk-per-trade and overnight-gap sizing, 15% single / 30% sector / 80% gross
+  exposure caps, 5 concurrent positions, 20 trades/day, 1.0x leverage unless calm
+  low-vol (up to 1.25x), spread/tradeable/buying-power/duplicate checks, and
+  60-day correlation reduce/reject. Circuit breakers on actual P&L: daily 2%/3%
+  and weekly 5%/7% reduce/halt, and a 10% peak drawdown halt that writes
+  `trading_halted.lock` — delete it manually to resume. All thresholds live in
+  the `risk` section of `settings.yaml`.
