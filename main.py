@@ -145,7 +145,13 @@ def run_backtest(config: dict[str, Any], args: argparse.Namespace | None = None)
 
     if args.stress_test:
         tester = StressTester(bt, seed=args.seed, n_sims=args.n_sims)
-        outcomes = tester.run_all(bars, baseline=result, start=args.start, end=args.end)
+        hmm_logger = logging.getLogger("regime_trader.hmm")
+        level = hmm_logger.level
+        hmm_logger.setLevel(logging.ERROR)  # injected shocks routinely produce zero-likelihood bars
+        try:
+            outcomes = tester.run_all(bars, baseline=result, start=args.start, end=args.end)
+        finally:
+            hmm_logger.setLevel(level)
         table = summarize(outcomes, result)
         from backtest.performance import _frame_table
 
