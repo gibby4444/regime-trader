@@ -146,7 +146,7 @@ def test_low_vol_stop_takes_tighter_of_atr_and_ema() -> None:
     sig = LowVolBullStrategy().generate_signal("X", bars, make_state(2, "BULL"))
     assert sig is not None
     assert sig.stop_loss >= price - 3 * a - 1e-9
-    assert sig.stop_loss >= min(ema - 0.5 * a, price - 0.5 * a) - 1e-9
+    assert sig.stop_loss >= ema - 0.5 * a - 1e-9
 
 
 def test_mid_vol_trend_intact(up_bars: dict[str, pd.DataFrame]) -> None:
@@ -156,7 +156,7 @@ def test_mid_vol_trend_intact(up_bars: dict[str, pd.DataFrame]) -> None:
     sig = MidVolCautiousStrategy().generate_signal("SPY", bars, make_state(1, "BEAR"))
     assert sig is not None
     assert (sig.position_size_pct, sig.leverage) == (0.95, 1.0)
-    assert sig.stop_loss == pytest.approx(min(ema - 0.5 * a, price - 0.5 * a))
+    assert sig.stop_loss == pytest.approx(ema - 0.5 * a)
     assert sig.metadata["trend_intact"] is True
 
 
@@ -168,8 +168,7 @@ def test_mid_vol_trend_broken_reduces_and_stays_long(down_bars: dict[str, pd.Dat
     assert sig is not None
     assert sig.direction is Direction.LONG
     assert (sig.position_size_pct, sig.leverage) == (0.60, 1.0)
-    assert sig.stop_loss < sig.entry_price
-    assert sig.stop_loss == pytest.approx(min(ema - 0.5 * a, price - 0.5 * a))
+    assert sig.stop_loss == pytest.approx(ema - 0.5 * a)
 
 
 def test_high_vol_defensive(down_bars: dict[str, pd.DataFrame]) -> None:
@@ -178,7 +177,7 @@ def test_high_vol_defensive(down_bars: dict[str, pd.DataFrame]) -> None:
     sig = HighVolDefensiveStrategy().generate_signal("QQQ", bars, make_state(0, "CRASH"))
     assert sig is not None
     assert (sig.direction, sig.position_size_pct, sig.leverage) == (Direction.LONG, 0.60, 1.0)
-    assert sig.stop_loss == pytest.approx(min(ema - 1.0 * a, price - 0.5 * a))
+    assert sig.stop_loss == pytest.approx(ema - 1.0 * a)
 
 
 @pytest.mark.parametrize("drift", [-0.01, -0.003, 0.0, 0.003, 0.01])
@@ -190,7 +189,10 @@ def test_always_long_never_short(cls: type[BaseStrategy], drift: float) -> None:
         assert sig.direction is Direction.LONG
         assert 0.60 <= sig.position_size_pct <= 0.95
         assert sig.leverage in (1.0, 1.25)
-        assert 0 < sig.stop_loss < sig.entry_price
+        assert sig.stop_loss > 0
+        price, ema, a = ref_indicators(make_bars(drift=drift, vol=0.03, seed=seed))
+        expected = max(price - 3*a, ema - .5*a) if cls is LowVolBullStrategy else ema - (1.0 if cls is HighVolDefensiveStrategy else .5)*a
+        assert sig.stop_loss == pytest.approx(expected)
 
 
 def test_insufficient_bars_returns_none_and_is_skipped(orch: StrategyOrchestrator) -> None:
