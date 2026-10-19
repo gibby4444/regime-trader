@@ -100,7 +100,6 @@ class StrategyConfig:
     low_vol_ema_atr_mult: float = 0.5
     mid_vol_ema_atr_mult: float = 0.5
     high_vol_ema_atr_mult: float = 1.0
-    min_stop_distance_atr: float = 0.5
     low_vol_rank_cutoff: float = 0.33
     high_vol_rank_cutoff: float = 0.67
     min_confidence: float = 0.55
@@ -171,10 +170,6 @@ class BaseStrategy(ABC):
             return None
         return ind
 
-    def clamp_stop(self, stop: float, ind: Indicators) -> float:
-        """Keep a long stop at least ``min_stop_distance_atr`` ATR below entry."""
-        return min(stop, ind.price - self.config.min_stop_distance_atr * ind.atr)
-
     def build_signal(
         self,
         symbol: str,
@@ -192,7 +187,7 @@ class BaseStrategy(ABC):
             direction=Direction.LONG,
             confidence=regime_state.probability,
             entry_price=ind.price,
-            stop_loss=self.clamp_stop(stop, ind),
+            stop_loss=stop,
             take_profit=None,
             position_size_pct=size,
             leverage=leverage,
@@ -324,12 +319,13 @@ class AllocationTarget:
 class StrategyOrchestrator:
     """Maps regimes to strategies by volatility rank and produces adjusted signals."""
 
-    def __init__(self, config: StrategyConfig, regime_infos: list[RegimeInfo]) -> None:
+    def __init__(self, config: StrategyConfig, regime_infos: list[RegimeInfo] | None = None) -> None:
         self.config = config
         self._strategies: dict[VolRegime, BaseStrategy] = {
             vr: cls(config) for vr, cls in VOL_REGIME_TO_STRATEGY.items()
         }
-        self.update_regimes(regime_infos)
+        if regime_infos is not None:
+            self.update_regimes(regime_infos)
 
     @classmethod
     def from_engine(cls, config: StrategyConfig, engine: HMMEngine) -> StrategyOrchestrator:

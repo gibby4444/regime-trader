@@ -164,7 +164,7 @@ class HMMConfig:
     tol: float = 1e-4
     min_covar: float = 1e-3
     random_state: int | None = 42
-    min_train_bars: int = 504
+    min_train_bars: int = 252
     retrain_interval_bars: int = 21
     stability_bars: int = 3
     flicker_window: int = 20

@@ -25,8 +25,8 @@ hmm:
   min_covar: 0.001
   # Base seed; init i uses random_state + i. null = non-deterministic.
   random_state: 42
-  # Minimum number of (post-warm-up) feature bars required to train (~2 trading years).
-  min_train_bars: 504
+  # Minimum number of (post-warm-up) feature bars required to train (~1 trading year).
+  min_train_bars: 252
   # Expanding-window retrain every N new bars.
   retrain_interval_bars: 21
   # A new regime must persist this many consecutive bars before it is confirmed.
@@ -89,8 +89,6 @@ strategy:
   mid_vol_ema_atr_mult: 0.5
   # High vol stop = EMA - high_vol_ema_atr_mult*ATR.
   high_vol_ema_atr_mult: 1.0
-  # Stops are clamped to at least this many ATR below entry (EMA-based stops can sit above price).
-  min_stop_distance_atr: 0.5
   # Vol-rank position = rank / (n_regimes - 1): <= low cutoff -> LowVol, >= high cutoff -> HighVol.
   low_vol_rank_cutoff: 0.33
   high_vol_rank_cutoff: 0.67
@@ -98,12 +96,24 @@ strategy:
 risk:
   # Max fraction of equity risked on a single trade (stop-distance based sizing).
   max_risk_per_trade: 0.01
-  # Max gross exposure as a fraction of equity (before leverage allowance).
+  # Hard maximum gross exposure as a fraction of equity.
   max_exposure: 0.80
   # Hard cap on gross leverage.
   max_leverage: 1.25
   # Max weight of any single position.
   max_single_position: 0.15
+  max_sector_exposure: 0.30
+  lock_path: trading_halted.lock
+  min_position: 100
+  gap_multiple: 3
+  max_gap_risk: 0.02
+  max_spread: 0.005
+  duplicate_seconds: 60
+  correlation_window: 60
+  correlation_reduce: 0.7
+  correlation_reject: 0.85
+  min_confidence: 0.55
+  flicker_threshold: 4
   # Max number of concurrently open positions.
   max_concurrent: 5
   # Max number of orders submitted per trading day.
@@ -125,13 +135,17 @@ backtest:
   # Starting equity in account currency.
   initial_capital: 100000
   # Walk-forward initial in-sample (training) window, in bars; must be >= hmm.min_train_bars.
-  train_window: 504
+  train_window: 252
   # Walk-forward out-of-sample (test) window, in bars.
   test_window: 126
   # Bars to advance between walk-forward folds.
   step_size: 126
   # Annual risk-free rate used for Sharpe/Sortino.
   risk_free_rate: 0.045
+  random_seeds: 100
+  stress_simulations: 100
+  stress_points: 10
+  commission: 0.0
 
 monitoring:
   # Terminal dashboard refresh interval.
