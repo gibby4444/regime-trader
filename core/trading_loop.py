@@ -255,6 +255,9 @@ class TradingLoop:
                              decision.modifications or decision.rejection_reason or 'risk approved')
                     if decision.approved and self.entries_allowed() and not self.dry_run:
                         chosen = decision.modified_signal or proposed
+                        # Persist the consumed bar and duplicate guard before a broker
+                        # write: acceptance may precede a process kill or timeout.
+                        self.save_snapshot()
                         self.executor.submit_order(chosen, risk_decision=decision)
         # Stop candidates come from the current regime even while signals are paused/halted.
         if self.last_regime is not None:
@@ -271,6 +274,7 @@ class TradingLoop:
         self.refresh()
         if self.trained_at is not None and self.now() - self.trained_at > WEEK:
             self.ensure_model()
+        self.save_snapshot()
 
     def refresh(self):
         base = self.portfolio.equity-self.portfolio.daily_pnl
@@ -303,9 +307,11 @@ class TradingLoop:
                 ('peak_equity', 'day_start_equity', 'week_start_equity', 'trades_today',
                  '_last_equity', '_acknowledged_peak', '_day', '_week')}
         payload = dict(version=1, model_trained_at=self.trained_at, risk=risk,
+                       duplicates=[dict(symbol=s, direction=d.value, timestamp=t)
+                                   for (s, d), t in self.risk._duplicates.items()],
                        breaker=sorted(self.risk.breaker.active), lock_written=self.risk.breaker._lock_written,
                        state=self.risk.state.value,
-                       counts=self.counts, positions={s: asdict(p) for s, p in self.tracker.positions.items()})
+                       counts=self.counts, positions={s: vars(p).copy() for s, p in self.tracker.positions.items()})
         if self.last_regime is not None:
             payload['regime'] = asdict(self.last_regime)
             payload['alpha'] = self.engine._log_alpha
@@ -337,6 +343,12 @@ class TradingLoop:
         self.risk.breaker.active.update(data['breaker'])
         self.risk.breaker._lock_written = data.get('lock_written', False)
         self.risk.state = TradingState(data['state'])
+        from core.regime_strategies import Direction
+        self.risk._duplicates = {
+            (item['symbol'], Direction(item['direction'])): datetime.fromisoformat(item['timestamp'])
+            for item in data.get('duplicates', [])
+        }
+        self.counts.update(data.get('counts', {}))
         if self.risk._day == self.now().date() and self.risk.day_start_equity is not None:
             self.portfolio.daily_pnl = self.portfolio.equity-self.risk.day_start_equity
             self.portfolio.daily_trades = self.risk.trades_today
