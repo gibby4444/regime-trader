@@ -11,7 +11,10 @@ from collections.abc import Callable
 
 import pandas as pd
 
-from broker.alpaca_client import AlpacaClient
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from broker.alpaca_client import AlpacaClient
 
 BarCallback = Callable[[str, pd.Series], None]
 
@@ -68,3 +71,18 @@ class MarketDataFeed:
     def validate(bars: pd.DataFrame) -> pd.DataFrame:
         """Check monotonic index, drop duplicates, flag gaps/NaNs."""
         raise NotImplementedError
+
+
+def load_yfinance_history(symbols, start, end=None):
+    """Optional historical loader. Import and network access happen only on invocation."""
+    import yfinance as yf
+    from data.feature_engineering import validate_bars
+    result = {}
+    for symbol in symbols:
+        bars = yf.download(symbol, start=start, end=end, auto_adjust=True, progress=False)
+        if isinstance(bars.columns, pd.MultiIndex):
+            bars.columns = bars.columns.get_level_values(0)
+        if bars.empty:
+            raise ValueError(f"No historical data for {symbol}")
+        result[symbol] = validate_bars(bars)
+    return result
