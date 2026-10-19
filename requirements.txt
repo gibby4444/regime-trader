@@ -13,3 +13,5 @@ schedule
 rich
 
 # Dev: pip install pytest
+
+# Optional historical CLI loader: install yfinance separately when needed.

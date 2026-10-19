@@ -53,8 +53,8 @@ def test_volatility_bucket() -> None:
 
 def test_fit_requires_min_train_bars(features: pd.DataFrame) -> None:
     engine = HMMEngine(fast_config())
-    with pytest.raises(ValueError, match="at least 504"):
-        engine.fit(features.iloc[:503])
+    with pytest.raises(ValueError, match="at least 252"):
+        engine.fit(features.iloc[:251])
 
 
 def test_unfitted_engine_raises(features: pd.DataFrame) -> None:
@@ -246,7 +246,7 @@ def test_save_load_roundtrip(trained_engine: HMMEngine, features: pd.DataFrame, 
 def test_config_from_settings_yaml() -> None:
     settings = yaml.safe_load(SETTINGS.read_text())
     cfg = HMMConfig.from_dict(settings["hmm"])
-    assert cfg.min_train_bars == 504
+    assert cfg.min_train_bars == 252
     assert cfg.transition_size_mult == 0.75
     assert cfg.n_candidates == [3, 4, 5, 6, 7] and cfg.n_init == 10
     assert cfg.covariance_type == "full"
