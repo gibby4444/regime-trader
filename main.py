@@ -89,6 +89,10 @@ def build_live_loop(config, *, dry_run=False):
     from monitoring.alerts import AlertManager
     import time
 
+    from monitoring.logger import setup_logging
+    monitoring = config.get('monitoring', {})
+    setup_logging(log_dir=monitoring.get('log_dir', 'logs'))
+    webhook = monitoring.get('webhook', {})
     client = AlpacaClient(config['broker'])
     symbols = config['broker']['symbols']
     feed = MarketDataFeed(client, symbols, config['broker'].get('live_timeframe', '5Min'))
@@ -117,8 +121,10 @@ def build_live_loop(config, *, dry_run=False):
 
     return TradingLoop(config, client=client, feed=feed, engine=engine, features=features,
                        strategy=strategy, risk=risk, tracker=tracker,
-                       executor=OrderExecutor(client, risk, portfolio), dashboard=Dashboard(),
-                       alerts=AlertManager(), train=train, dry_run=dry_run, warm_history=warm_history)
+                       executor=OrderExecutor(client, risk, portfolio), dashboard=Dashboard(monitoring.get('dashboard_refresh_seconds', 5)),
+                       alerts=AlertManager(monitoring.get('alert_rate_limit_minutes', 15),
+                                           monitoring.get('email'),
+                                           webhook.get('url') if webhook.get('enabled', False) else None), train=train, dry_run=dry_run, warm_history=warm_history)
 
 
 def main(argv=None):

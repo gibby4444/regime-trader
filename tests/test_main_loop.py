@@ -244,7 +244,7 @@ def test_unhandled_saves_alerts_traceback(loop,caplog):
     with pytest.raises(RuntimeError,match='unexpected'):
         loop.run(install_signals=False)
     assert json.loads(loop.snapshot_path.read_text())['version'] == 1
-    loop.alerts.send.assert_called_once()
+    assert [c.args[0].key for c in loop.alerts.send.call_args_list].count('loop_error') == 1
     assert any(r.exc_info for r in caplog.records)
     loop.feed.stop_stream.assert_called_once()
 
@@ -335,11 +335,15 @@ def test_halted_stop_updates_bypass_entry_risk(loop):
     assert loop.client.trading.replace_order_by_id.call_count == 1
 
 
-def test_builder_is_lazy_and_does_not_read_credentials(monkeypatch):
+def test_builder_is_lazy_and_does_not_read_credentials(monkeypatch, tmp_path):
     from broker import alpaca_client
     monkeypatch.setattr(alpaca_client,'load_dotenv',lambda **kw: pytest.fail('No secrets'))
     monkeypatch.setattr(alpaca_client,'TradingClient',lambda *a,**kw: pytest.fail('No network'))
-    obj = main.build_live_loop(main.load_config(),dry_run=True)
+    config = main.load_config()
+    config['monitoring']['log_dir'] = str(tmp_path)
+    obj = main.build_live_loop(config,dry_run=True)
+    from monitoring.logger import setup_logging
+    setup_logging(json_file=False)
     assert obj.client.trading is None
     assert obj.config['broker']['paper_trading'] is True
     assert obj.config['risk']['max_exposure'] == .80

@@ -22,6 +22,7 @@ from core.hmm_engine import HMMEngine, RegimeState
 from core.risk_manager import PortfolioState, TradingState
 from monitoring.dashboard import DashboardState
 from monitoring.alerts import Alert, AlertSeverity
+from monitoring.logger import get_logger, log_event
 
 log = logging.getLogger(__name__)
 WEEK = timedelta(days=7)
@@ -58,6 +59,9 @@ class TradingLoop:
         self.queue = Queue()
         self.running = self.online = False
         self.stopping = False
+        self.api_ok = True
+        self.api_latency_ms = 0
+        self.recent_signals = deque(maxlen=5)
         self.feed_ok = True
         self.last_regime = None
         self.last_prediction = None
@@ -72,10 +76,31 @@ class TradingLoop:
 
     def read(self, operation):
         from broker.alpaca_client import AlpacaClient
-        # The concrete adapter already retries reads/connect exactly three times.
-        if isinstance(getattr(operation, '__self__', None), AlpacaClient):
-            return operation()
-        return retry_api(operation, self.sleep)
+        started = time.perf_counter()
+        try:
+            result = operation() if isinstance(getattr(operation, '__self__', None), AlpacaClient) else retry_api(operation, self.sleep)
+            self.api_ok = True
+            return result
+        except Exception:
+            self.api_ok = False
+            self.emit_alert('api_lost', 'Broker API connection lost', AlertSeverity.CRITICAL)
+            raise
+        finally:
+            self.api_latency_ms = (time.perf_counter()-started)*1000
+
+    def monitoring_context(self):
+        return dict(regime=self.last_regime.label if self.last_regime else 'unknown',
+                    probability=self.last_regime.probability if self.last_regime else 0,
+                    equity=self.portfolio.equity, positions=copy.deepcopy(self.portfolio.positions),
+                    daily_pnl=self.portfolio.daily_pnl)
+
+    def emit_alert(self, key, message, severity=AlertSeverity.WARNING):
+        try:
+            self.alerts.send(Alert(key, severity, key.replace('_', ' ').title(), message,
+                                   self.now(), self.monitoring_context()))
+        except Exception:
+            log.error('Alert delivery failed for %s', key)
+
 
     def entries_allowed(self):
         return (not self.stopping and not Path(self.risk.config.lock_path).exists()
@@ -100,6 +125,7 @@ class TradingLoop:
             self.trained_at = self.now()
             self.engine.metadata['training_date'] = self.trained_at.isoformat()
             self.engine.save(self.model_path)
+            self.emit_alert("hmm_retrained", "HMM training completed", AlertSeverity.INFO)
         self.strategy.update_regimes(self.engine.regime_info)
 
     def startup(self):
@@ -143,6 +169,7 @@ class TradingLoop:
 
     def feed_dropped(self):
         self.feed_ok = False
+        self.emit_alert('data_feed_down', 'Data feed unavailable; signals paused')
         log.warning('Data feed dropped: signals paused; broker stops remain active')
 
     def feed_recovered(self):
@@ -158,6 +185,8 @@ class TradingLoop:
             self.risk.week_start_equity = self.portfolio.equity - self.portfolio.weekly_pnl
         self.risk.evaluate_state(self.portfolio.equity, self.portfolio.positions,
                                  self.last_regime.label if self.last_regime else None)
+        if self.risk.state != TradingState.NORMAL:
+            self.emit_alert('circuit_breaker', f'Trading state: {self.risk.state.value}', AlertSeverity.CRITICAL)
         # These exits deliberately bypass entry vetoes (Step 5).
         if execute and not self.stopping and self.risk.state in (TradingState.HALTED, TradingState.KILLED):
             for symbol in self.portfolio.positions:
@@ -195,7 +224,13 @@ class TradingLoop:
                 # An HMM failure cannot partially advance the forward or stability filters.
                 backup = copy.deepcopy(self.engine)
                 try:
+                    previous_regime = self.last_regime
                     self.last_regime = self.engine.update(frame.iloc[-1], stamp)
+                    if previous_regime is not None and previous_regime.label != self.last_regime.label:
+                        self.emit_alert('regime_change', f'{previous_regime.label} → {self.last_regime.label}', AlertSeverity.INFO)
+                    log_event(get_logger('regime'), 'Regime prediction', **self.monitoring_context())
+                    if self.engine.is_flickering():
+                        self.emit_alert('flicker_exceeded', 'Regime flicker threshold exceeded')
                 except Exception:
                     self.engine = backup
                     log.exception('HMM error: holding current regime')
@@ -211,6 +246,10 @@ class TradingLoop:
                     decision = self.risk.validate_signal(proposed, self.portfolio)
                     status = ('modified' if decision.modifications else 'approved') if decision.approved else 'rejected'
                     self.counts[status] += 1
+                    detail = decision.modifications or decision.rejection_reason or 'risk approved'
+                    self.recent_signals.append(f'{self.now():%H:%M} │ {proposed.symbol} │ {status} │ {detail}')
+                    log_event(get_logger('trades'), 'Signal decision', symbol=proposed.symbol,
+                              status=status, detail=detail, **self.monitoring_context())
                     self.target_weights.update(decision.adjusted_weights)
                     log.info('%s %s: %s', status, proposed.symbol,
                              decision.modifications or decision.rejection_reason or 'risk approved')
@@ -234,11 +273,27 @@ class TradingLoop:
             self.ensure_model()
 
     def refresh(self):
+        base = self.portfolio.equity-self.portfolio.daily_pnl
+        threshold = self.config.get('monitoring', {}).get('large_pnl_fraction', .02)
+        if base > 0 and abs(self.portfolio.daily_pnl)/base >= threshold:
+            self.emit_alert('large_pnl', f'Daily P&L: {self.portfolio.daily_pnl:+.2f}')
+        log_event(get_logger('main'), 'Portfolio snapshot', **self.monitoring_context())
+        gross = sum(abs(p.get('market_value', 0)) for p in self.portfolio.positions.values())
         self.dashboard.update(DashboardState(
             regime=self.last_regime.label if self.last_regime else 'unknown',
             confidence=self.last_regime.probability if self.last_regime else 0,
             equity=self.portfolio.equity, daily_pnl=self.portfolio.daily_pnl,
             trading_state=self.risk.state.value,
+            stability=self.last_regime.consecutive_bars if self.last_regime else 0,
+            flicker=self.last_regime.flicker_rate if self.last_regime else 0,
+            flicker_window=self.config.get('hmm', {}).get('flicker_window', 20),
+            allocation=gross/self.portfolio.equity if self.portfolio.equity else 0,
+            leverage=gross/self.portfolio.equity if self.portfolio.equity else 0,
+            daily_drawdown=max(0, -self.portfolio.daily_pnl/base) if base > 0 else 0,
+            daily_limit=self.risk.config.daily_dd_halt, peak_limit=self.risk.config.max_dd_from_peak,
+            data_ok=self.feed_ok, api_ok=self.api_ok, api_latency_ms=self.api_latency_ms,
+            hmm_age_days=(self.now()-self.trained_at).total_seconds()/86400 if self.trained_at else None,
+            paper=self.config['broker'].get('paper_trading', True), recent_events=list(self.recent_signals),
             drawdown=self.risk.drawdown_from_peak(self.portfolio.equity),
             target_weights=dict(self.target_weights),
             positions=[dict(symbol=s, **p) for s, p in self.portfolio.positions.items()]))
@@ -347,6 +402,7 @@ class TradingLoop:
                     stale = any(self.now()-self.last_seen.get(s, self.feed_started_at) > timedelta(minutes=10) for s in self.symbols)
                     if (thread is not None and not thread.is_alive()) or stale:
                         self.feed_dropped()
+                    self.refresh()
                     self.sleep(1)
                     continue
                 clock = self.read(self.client.get_clock)
@@ -362,8 +418,7 @@ class TradingLoop:
             try:
                 self.save_snapshot()
             finally:
-                self.alerts.send(Alert('loop_error', AlertSeverity.CRITICAL,
-                                       'Trading loop stopped', str(exc), self.now()))
+                self.emit_alert('loop_error', 'Trading loop stopped', AlertSeverity.CRITICAL)
             raise
         finally:
             try:
