@@ -1,80 +1,97 @@
-"""Terminal live dashboard built on ``rich``.
-
-Shows current regime and confidence, target vs actual allocation, positions and
-P&L, risk state/drawdowns, and recent orders/alerts. Refreshes every
-``monitoring.dashboard_refresh_seconds``.
-"""
-
-from __future__ import annotations
-
+"""Five-second Rich monitoring dashboard."""
 from dataclasses import dataclass, field
 from typing import Any
-
 from rich.console import Console
 from rich.layout import Layout
 from rich.live import Live
+from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 
 @dataclass
 class DashboardState:
-    """Snapshot of everything the dashboard renders."""
-
-    regime: str = "unknown"
-    confidence: float = 0.0
-    equity: float = 0.0
-    daily_pnl: float = 0.0
-    drawdown: float = 0.0
-    trading_state: str = "normal"
+    regime: str = 'unknown'
+    confidence: float = 0
+    equity: float = 0
+    daily_pnl: float = 0
+    drawdown: float = 0
+    trading_state: str = 'normal'
     positions: list[dict[str, Any]] = field(default_factory=list)
     target_weights: dict[str, float] = field(default_factory=dict)
     recent_events: list[str] = field(default_factory=list)
+    stability: int = 0
+    flicker: int = 0
+    flicker_window: int = 20
+    allocation: float = 0
+    leverage: float = 0
+    daily_drawdown: float = 0
+    daily_limit: float = .03
+    peak_limit: float = .10
+    data_ok: bool = True
+    api_ok: bool = True
+    api_latency_ms: float = 0
+    hmm_age_days: float | None = None
+    paper: bool = True
+
+
+def risk_color(value, limit):
+    ratio = value/limit if limit > 0 else 1
+    return 'red' if ratio >= 1 else 'yellow' if ratio >= .7 else 'green'
+
+
+def risk_bar(label, value, limit):
+    color = risk_color(value, limit)
+    filled = min(10, max(0, int(value/limit*10))) if limit > 0 else 10
+    return f'{label}: [{color}]{"█"*filled}{"░"*(10-filled)} {value:.1%}/{limit:.0%}[/{color}]'
 
 
 class Dashboard:
-    """Renders :class:`DashboardState` in a live-updating terminal layout."""
-
-    def __init__(self, refresh_seconds: float = 5.0, console: Console | None = None) -> None:
-        """Configure refresh cadence and output console."""
+    def __init__(self, refresh_seconds=5, console=None):
         self.refresh_seconds = refresh_seconds
         self.console = console or Console()
         self.state = DashboardState()
-        self._live: Live | None = None
+        self._live = None
 
-    def build_layout(self) -> Layout:
-        """Compose header, regime, positions, risk, and events panels."""
+    def build_layout(self):
+        s = self.state
+        base = s.equity-s.daily_pnl
+        daily_pct = s.daily_pnl/base if base else 0
+        age = 'unknown' if s.hmm_age_days is None else f'{s.hmm_age_days:.1f}d ago'
+        panels = [
+            ('REGIME', f'{s.regime} ({s.confidence:.0%}) │ Stability: {s.stability} bars │ Flicker: {s.flicker}/{s.flicker_window}', 3),
+            ('PORTFOLIO', f'Equity: ${s.equity:,.0f} │ Daily: {s.daily_pnl:+,.0f} ({daily_pct:+.2%})\nAllocation: {s.allocation:.0%} │ Leverage: {s.leverage:.2f}x', 4),
+            ('POSITIONS', self.positions_table(), max(6, len(s.positions)+6)),
+            ('RECENT SIGNALS', '\n'.join(s.recent_events[-5:]) or 'None', 7),
+            ('RISK STATUS', Text.from_markup(risk_bar('Daily DD', s.daily_drawdown, s.daily_limit)+' │ '+risk_bar('From Peak', s.drawdown, s.peak_limit)+'\n'+s.trading_state), 4),
+            ('SYSTEM', f'Data: {"✅" if s.data_ok else "❌"} │ API: {"✅" if s.api_ok else "❌"} {s.api_latency_ms:.0f}ms │ HMM: {age} │ {"PAPER" if s.paper else "LIVE"}', 3)]
         layout = Layout()
-        header = Table(title=f"Regime: {self.state.regime} ({self.state.confidence:.1%})")
-        header.add_column('Equity')
-        header.add_column('Daily P&L')
-        header.add_column('Risk state')
-        header.add_row(f'{self.state.equity:,.2f}', f'{self.state.daily_pnl:,.2f}', self.state.trading_state)
-        layout.split_column(Layout(header, size=5), Layout(self.positions_table()))
+        layout.split_column(*(Layout(Panel(body, title=title), name=title, size=size) for title, body, size in panels))
         return layout
 
-    def positions_table(self) -> Table:
-        """Render open positions with qty, price, value, and unrealised P&L."""
-        table = Table(title='Positions')
-        for name in ('symbol', 'qty', 'current_price', 'unrealized_pnl', 'stop'):
+    def positions_table(self):
+        table = Table(expand=True)
+        for name in ('Symbol', 'Side', 'Price', 'P&L', 'Stop', 'Age'):
             table.add_column(name)
-        for position in self.state.positions:
-            table.add_row(*(str(position.get(k, '')) for k in
-                            ('symbol', 'qty', 'current_price', 'unrealized_pnl', 'stop')))
+        for p in self.state.positions:
+            cost = abs(p.get('qty', 0)*p.get('entry_price', 0))
+            pct = p.get('unrealized_pnl', 0)/cost if cost else 0
+            table.add_row(str(p.get('symbol', '')), 'LONG' if p.get('qty', 0)>0 else 'SHORT',
+                          f'${p.get("current_price", 0):.2f}', f'{pct:+.1%}',
+                          str(p.get('stop', '')), str(p.get('holding_period', '')))
         return table
 
-    def update(self, state: DashboardState) -> None:
-        """Replace the current state and trigger a re-render."""
+    def update(self, state):
         self.state = state
-        if self._live is not None:
+        if self._live:
             self._live.update(self.build_layout())
 
-    def start(self) -> None:
-        """Begin the ``rich.live.Live`` rendering loop."""
-        self._live = Live(self.build_layout(), console=self.console, auto_refresh=False)
-        self._live.start()
+    def start(self):
+        if self._live is None:
+            self._live = Live(self.build_layout(), console=self.console, refresh_per_second=1/self.refresh_seconds)
+            self._live.start()
 
-    def stop(self) -> None:
-        """Stop live rendering and restore the terminal."""
-        if self._live is not None:
+    def stop(self):
+        if self._live:
             self._live.stop()
             self._live = None

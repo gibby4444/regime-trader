@@ -1,37 +1,76 @@
-"""Structured (JSON-lines) logging setup.
-
-Console output is human-readable; file output is one JSON object per line with
-timestamp, level, logger, message, and any ``extra`` context fields.
-"""
-
+"""JSON logs with size rotation and age-based archive retention."""
 from __future__ import annotations
-
+import json
 import logging
-from typing import Any
+import time
+from datetime import datetime, timezone
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
+
+FIELDS = dict(regime='unknown', probability=0.0, equity=0.0, positions={}, daily_pnl=0.0)
 
 
 class JsonFormatter(logging.Formatter):
-    """Formats log records as single-line JSON."""
-
-    def format(self, record: logging.LogRecord) -> str:
-        """Serialise ``record`` (including ``extra`` fields) to JSON."""
-        raise NotImplementedError
-
-
-def setup_logging(
-    level: str = "INFO",
-    log_dir: str = "logs",
-    json_file: bool = True,
-) -> None:
-    """Configure root logging with console and (optionally) rotating JSON file handlers."""
-    raise NotImplementedError
+    def format(self, record):
+        data = dict(FIELDS, timestamp=datetime.fromtimestamp(record.created, timezone.utc).isoformat(),
+                    level=record.levelname, logger=record.name, message=record.getMessage())
+        data.update(getattr(record, 'context', {}))
+        data.update({k: getattr(record, k) for k in FIELDS if hasattr(record, k)})
+        if record.exc_info:
+            data['exception'] = self.formatException(record.exc_info)
+        return json.dumps(data, default=str)
 
 
-def get_logger(name: str) -> logging.Logger:
-    """Return a module logger under the ``regime_trader`` namespace."""
-    raise NotImplementedError
+class RetentionHandler(RotatingFileHandler):
+    retention_days = 30
+
+    def __init__(self, filename):
+        # No count cap: archives are retained by age, even on busy trading days.
+        super().__init__(filename, maxBytes=10*1024*1024, backupCount=0, encoding='utf-8')
+        self.prune()
+
+    def prune(self):
+        for path in Path(self.baseFilename).parent.glob(Path(self.baseFilename).name + '.*'):
+            if path.is_file() and path.stat().st_mtime < time.time()-self.retention_days*86400:
+                path.unlink()
+
+    def doRollover(self):
+        if self.stream:
+            self.stream.close()
+            self.stream = None
+        source = Path(self.baseFilename)
+        if source.exists():
+            source.rename(str(source) + '.' + str(time.time_ns()))
+        self.prune()
+        self.stream = self._open()
+
+    def emit(self, record):
+        self.prune()
+        super().emit(record)
 
 
-def log_event(logger: logging.Logger, event: str, **fields: Any) -> None:
-    """Log a named structured event with arbitrary key/value context."""
-    raise NotImplementedError
+def setup_logging(level='INFO', log_dir='logs', json_file=True):
+    root = logging.getLogger()
+    root.setLevel(level)
+    for handler in list(root.handlers):
+        if getattr(handler, '_monitoring', False):
+            root.removeHandler(handler)
+            handler.close()
+    if not json_file:
+        return
+    Path(log_dir).mkdir(parents=True, exist_ok=True)
+    for category in ('main', 'trades', 'alerts', 'regime'):
+        handler = RetentionHandler(Path(log_dir)/f'{category}.log')
+        handler._monitoring = True
+        handler.setFormatter(JsonFormatter())
+        handler.addFilter(lambda r, c=category: c == 'main' or getattr(r, 'category', '') == c
+                          or r.name.startswith('regime_trader.' + c))
+        root.addHandler(handler)
+
+
+def get_logger(name):
+    return logging.getLogger('regime_trader.' + name)
+
+
+def log_event(logger, event, **fields):
+    logger.info(event, extra={'context': fields, 'category': fields.get('category', '')})

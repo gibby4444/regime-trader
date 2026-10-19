@@ -8,7 +8,7 @@ changes. Repeated alerts of the same key are suppressed for
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -39,8 +39,12 @@ class AlertManager:
         rate_limit_minutes: int = 15,
         email_config: dict[str, Any] | None = None,
         webhook_url: str | None = None,
+        *, clock=None, console=None,
     ) -> None:
         """Configure channels; either may be None to disable it."""
+        from rich.console import Console
+        self.clock = clock or (lambda: datetime.now(timezone.utc))
+        self.console = console or Console()
         self.rate_limit_minutes = rate_limit_minutes
         self.email_config = email_config
         self.webhook_url = webhook_url
@@ -49,25 +53,56 @@ class AlertManager:
     def should_send(self, alert: Alert) -> bool:
         """False if an alert with the same key was sent within the rate-limit window."""
         previous = self._last_sent.get(alert.key)
-        return previous is None or (alert.timestamp-previous).total_seconds() >= self.rate_limit_minutes*60
+        return previous is None or (self.clock()-previous).total_seconds() >= self.rate_limit_minutes*60
 
     def send(self, alert: Alert) -> bool:
         """Send to all channels if not rate-limited; return True if dispatched."""
-        import logging
+        from monitoring.logger import get_logger, log_event
         if not self.should_send(alert):
             return False
-        logging.getLogger(__name__).critical('%s: %s', alert.title, alert.message)
-        if self.email_config:
-            self.send_email(alert)
-        if self.webhook_url:
-            self.send_webhook(alert)
-        self._last_sent[alert.key] = alert.timestamp
+        self._last_sent[alert.key] = self.clock()
+        for deliver in (self.console_delivery, self.log_delivery, self.send_email, self.send_webhook):
+            try:
+                deliver(alert)
+            except Exception:
+                # Transport exceptions can contain secrets; never log their text.
+                log_event(get_logger('alerts'), 'Alert delivery failed', event_type=alert.key, **alert.context)
         return True
 
-    def send_email(self, alert: Alert) -> None:
-        """Send via SMTP (STARTTLS) using ``email_config``."""
-        raise ValueError('Email delivery is not configured for the local trading loop')
+    def console_delivery(self, alert):
+        self.console.print(f'{alert.severity.value.upper()}: {alert.title}: {alert.message}', markup=False)
 
-    def send_webhook(self, alert: Alert) -> None:
-        """POST a JSON payload to ``webhook_url``."""
-        raise ValueError('Webhook delivery is not configured for the local trading loop')
+    def log_delivery(self, alert):
+        from monitoring.logger import get_logger, log_event
+        log_event(get_logger('alerts'), alert.title, event_type=alert.key,
+                  severity=alert.severity.value, detail=alert.message, **alert.context)
+
+    def send_email(self, alert):
+        import os
+        import smtplib
+        from email.message import EmailMessage
+        config = self.email_config or {}
+        if not config.get('enabled', False):
+            return
+        message = EmailMessage()
+        message['Subject'] = alert.title
+        message['From'] = config['sender']
+        message['To'] = config['recipient']
+        message.set_content(alert.message)
+        with smtplib.SMTP(config['host'], config.get('port', 587), timeout=5) as smtp:
+            smtp.starttls()
+            if config.get('username'):
+                smtp.login(config['username'], os.environ[config.get('password_env', 'ALERT_SMTP_PASSWORD')])
+            smtp.send_message(message)
+
+    def send_webhook(self, alert):
+        import json
+        from urllib.request import Request, urlopen
+        if not self.webhook_url:
+            return
+        payload = dict(text=f'{alert.title}: {alert.message}', event_type=alert.key,
+                       timestamp=alert.timestamp.isoformat(), context=alert.context)
+        request = Request(self.webhook_url, data=json.dumps(payload, default=str).encode(),
+                          headers={'Content-Type': 'application/json'}, method='POST')
+        with urlopen(request, timeout=5):
+            pass

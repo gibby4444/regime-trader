@@ -154,3 +154,17 @@ monitoring:
   dashboard_refresh_seconds: 5
   # Minimum minutes between repeated alerts of the same type.
   alert_rate_limit_minutes: 15
+  log_dir: logs
+  # Alert when absolute daily P&L reaches this fraction of starting equity.
+  large_pnl_fraction: 0.02
+  email:
+    enabled: false
+    host: ''
+    port: 587
+    sender: ''
+    recipient: ''
+    username: ''
+    password_env: ALERT_SMTP_PASSWORD
+  webhook:
+    enabled: false
+    url: ''
