@@ -46,11 +46,11 @@ class StressOutcome:
 
 
 def kill_events(result: BacktestResult) -> int:
-    """Number of times the kill switch tripped."""
+    """Number of times the peak-drawdown breaker (trading lock) tripped."""
     state = result.regime_history.get("risk_state")
     if state is None:
         return 0
-    killed = state == "killed"
+    killed = state == "locked"
     return int((killed & ~killed.shift(1, fill_value=False)).sum())
 
 

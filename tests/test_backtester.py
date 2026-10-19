@@ -11,12 +11,11 @@ from backtest.backtester import (
     BacktestConfig,
     Portfolio,
     TargetSignal,
-    _apply_risk,
     apply_slippage,
     run_simulation,
 )
 from core.hmm_engine import HMMEngine
-from core.risk_manager import RiskConfig, TradingState
+from core.risk_manager import RiskConfig
 
 
 def flat_bars(prices: list[float] | np.ndarray, opens: list[float] | np.ndarray | None = None) -> pd.DataFrame:
@@ -135,33 +134,77 @@ def test_trades_pnl_sums_to_total() -> None:
 # ------------------------------------------------------------------ risk rules
 
 
-def test_apply_risk_states() -> None:
-    rc = RiskConfig()
-    w = {"A": 1.1875}
-    assert _apply_risk(w, TradingState.NORMAL, 0.0, rc) == w
-    assert _apply_risk(w, TradingState.REDUCED, 0.0, rc)["A"] == pytest.approx(1.1875 * 0.5)
-    assert _apply_risk(w, TradingState.KILLED, 1.0, rc) == {"A": 0.0}
-    assert _apply_risk(w, TradingState.HALTED, 0.6, rc) is None, "halt blocks exposure increases"
-    assert _apply_risk({"A": 0.3}, TradingState.HALTED, 0.6, rc) == {"A": 0.3}, "halt allows de-risking"
-    assert _apply_risk({"A": 2.0}, TradingState.NORMAL, 0.0, rc)["A"] == pytest.approx(rc.max_leverage)
-    assert _apply_risk(w, None, 0.0, None) == w
+def loose_risk(**overrides: object) -> RiskConfig:
+    """Risk config with sizing caps opened up so breaker behaviour can be isolated."""
+    params: dict[str, object] = dict(
+        max_single_position=1.0, max_exposure=1.0, max_sector_exposure=1.0, max_risk_per_trade=1.0,
+        max_gap_loss=1.0, regime_max_position={"low": 1.0, "mid": 1.0, "high": 1.0},
+        daily_dd_reduce=1, daily_dd_halt=1, weekly_dd_reduce=1, weekly_dd_halt=1,
+    )
+    params.update(overrides)
+    return RiskConfig(**params)  # type: ignore[arg-type]
 
 
-def test_kill_switch_flattens_and_rearms() -> None:
-    prices = np.r_[np.full(5, 100.0), np.linspace(100, 80, 15), np.full(10, 80.0)]
+def test_risk_manager_caps_backtest_position() -> None:
+    bars = flat_bars(np.linspace(100, 120, 30))
+    sim = run_simulation({"A": bars}, bars.index, schedule([1.0]), BacktestConfig(), RiskConfig())
+    assert (sim.allocation.iloc[:14] == 0).all(), "no stop (ATR warm-up) -> orders refused"
+    assert sim.risk_rejections["reason"].eq("missing_stop_loss").all()
+    assert 0.12 < sim.allocation.iloc[20] <= 0.16, "15% single-position cap vetoes the 100% target"
+
+
+WARM = 25  # flat bars so the ATR-based synthetic stop exists before any shock
+
+
+def test_peak_lock_flattens_and_releases_at_rearm() -> None:
+    prices = np.r_[np.full(WARM, 100.0), np.linspace(100, 80, 15), np.full(10, 80.0)]
     bars = flat_bars(prices)
-    rearm = bars.index[24]
+    rearm = bars.index[WARM + 19]
     sim = run_simulation(
-        {"A": bars}, bars.index, schedule([1.0]), BacktestConfig(slippage_pct=0.0),
-        RiskConfig(daily_dd_reduce=1, daily_dd_halt=1, weekly_dd_reduce=1, weekly_dd_halt=1),
+        {"A": bars}, bars.index, schedule([1.0]), BacktestConfig(slippage_pct=0.0), loose_risk(),
         rearm_at={rearm},
     )
-    killed = sim.risk_state[sim.risk_state == "killed"]
-    assert len(killed) > 0
-    first_kill = bars.index.get_loc(killed.index[0])
-    assert sim.allocation.iloc[first_kill + 1] == 0.0, "position flattened at the next open"
+    locked = sim.risk_state[sim.risk_state == "locked"]
+    assert len(locked) > 0
+    first = bars.index.get_loc(locked.index[0])
+    assert sim.allocation.iloc[first + 1] == 0.0, "position closed at the next open"
     assert sim.risk_state.loc[rearm] == "normal"
-    assert sim.allocation.iloc[-1] > 0.9, "trading resumes after re-arm"
+    assert sim.allocation.iloc[-1] > 0.9, "trading resumes after the lock is released"
+    ev = sim.risk_events
+    assert list(ev["breaker"]) == ["peak_halt"] and ev["positions_closed"].iloc[0] == ["A"]
+    assert ev["drawdown"].iloc[0] > 0.10 and ev["regime"].iloc[0] is None
+
+
+def test_daily_halt_closes_all_then_resumes_next_day() -> None:
+    prices = np.r_[np.full(WARM, 100.0), 96.0, np.full(8, 96.0)]
+    bars = flat_bars(prices)
+    sim = run_simulation(
+        {"A": bars}, bars.index, schedule([1.0]), BacktestConfig(slippage_pct=0.0),
+        loose_risk(daily_dd_reduce=0.02, daily_dd_halt=0.03),
+    )
+    assert sim.allocation.iloc[WARM - 1] > 0.9
+    assert sim.risk_state.iloc[WARM] == "halted"
+    assert sim.allocation.iloc[WARM + 1] == 0.0, "close ALL at the next open"
+    assert sim.risk_state.iloc[WARM + 1] == "normal", "daily halt lasts the rest of the day only"
+    assert sim.allocation.iloc[WARM + 2] > 0.9
+    assert set(sim.risk_events["breaker"]) == {"daily_halt", "daily_reduce"}
+
+
+def test_reduce_breaker_bypasses_rebalance_threshold() -> None:
+    prices = np.r_[np.full(WARM, 100.0), 97.5, np.full(5, 97.5)]
+    bars = flat_bars(prices)
+    sim = run_simulation(
+        {"A": bars}, bars.index, schedule([0.15]), BacktestConfig(slippage_pct=0.0),
+        loose_risk(daily_dd_reduce=0.002, daily_dd_halt=0.5),
+    )
+    assert sim.risk_state.iloc[WARM] == "reduced"
+    assert sim.allocation.iloc[WARM + 1] == pytest.approx(0.075, abs=0.002), "15% -> 7.5% despite 10% threshold"
+
+
+def test_weight_only_signals_get_synthetic_stops() -> None:
+    bars = flat_bars(np.linspace(100, 110, 40))
+    sim = run_simulation({"A": bars}, bars.index, schedule([None] * 20 + [1.0]), BacktestConfig(), RiskConfig())
+    assert not sim.fills.empty and sim.risk_rejections.empty
 
 
 def test_risk_disabled_keeps_full_exposure() -> None:
@@ -255,11 +298,22 @@ def test_start_end_and_warmup_history(synthetic: tuple[pd.DataFrame, pd.Series])
         bt.prepare({"SPY": bars.iloc[:600]})
 
 
-def test_multi_symbol_equal_weight(synthetic: tuple[pd.DataFrame, pd.Series]) -> None:
+def test_multi_symbol_equal_weight_without_risk(synthetic: tuple[pd.DataFrame, pd.Series]) -> None:
+    bars = synthetic[0]
+    other = bars * 1.0
+    other[["open", "high", "low", "close"]] *= 0.5
+    res = fast_backtester(risk=False).run({"SPY": bars, "QQQ": other}, start="2021-06-01")
+    w = res.weights[res.allocation > 0.5]
+    assert set(res.fills["symbol"]) == {"SPY", "QQQ"}
+    np.testing.assert_allclose(w["SPY"], w["QQQ"], atol=0.02)
+
+
+def test_multi_symbol_correlated_copy_is_vetoed(synthetic: tuple[pd.DataFrame, pd.Series]) -> None:
     bars = synthetic[0]
     other = bars * 1.0
     other[["open", "high", "low", "close"]] *= 0.5
     res = fast_backtester().run({"SPY": bars, "QQQ": other}, start="2021-06-01")
-    w = res.weights[res.allocation > 0.5]
-    assert set(res.fills["symbol"]) == {"SPY", "QQQ"}
-    np.testing.assert_allclose(w["SPY"], w["QQQ"], atol=0.02)
+    assert set(res.fills["symbol"]) == {"SPY"}
+    rej = res.risk_rejections[res.risk_rejections["symbol"] == "QQQ"]
+    assert rej["reason"].eq("correlation_too_high").any()
+    assert res.weights.max().max() <= 0.15 + 0.02, "single-position cap holds per symbol"

@@ -299,9 +299,14 @@ def random_allocation(
     change_prob: float,
     seed: int,
     rearm_at: frozenset[pd.Timestamp] = frozenset(),
+    meta: pd.DataFrame | None = None,
 ) -> pd.Series:
     """Random target changes (prob ``change_prob`` per bar, values drawn from ``allocations``)
-    under the same threshold, slippage, fill delay and risk rules as the strategy."""
+    under the same threshold, slippage, fill delay and risk rules as the strategy.
+
+    ``meta`` (the strategy's regime history) supplies the per-bar ``vol_regime`` /
+    ``uncertain`` labels the risk manager uses for leverage decisions.
+    """
     sym = list(bars_by_symbol)
     rng = np.random.default_rng(seed)
     draws = rng.random(len(index)) < change_prob
@@ -312,9 +317,15 @@ def random_allocation(
         if draws[i]:
             cur = values[i]
         path[i] = cur
-    return run_simulation(
-        bars_by_symbol, index, _constant_signal(sym, lambda p, t: float(path[p])), config, risk_config, rearm_at
-    ).equity
+    cols = [c for c in ("regime", "regime_id", "vol_regime", "uncertain", "probability", "flicker_rate")
+            if meta is not None and c in meta]
+    rows = meta[cols].reindex(index).to_dict("records") if cols else None
+
+    def signal(pos: int, ts: pd.Timestamp) -> TargetSignal:
+        m = {k: v for k, v in rows[pos].items() if pd.notna(v)} if rows else {}
+        return TargetSignal({s: float(path[pos]) / len(sym) for s in sym}, m)
+
+    return run_simulation(bars_by_symbol, index, signal, config, risk_config, rearm_at).equity
 
 
 def compare_benchmarks(
@@ -334,14 +345,16 @@ def compare_benchmarks(
     rows["200 SMA Trend"] = _summary(sma_trend(bars, index, config), init, rf)
 
     hist = result.regime_history
-    target = hist["target_allocation"].dropna() if "target_allocation" in hist else pd.Series(dtype=float)
+    col = "signal_allocation" if "signal_allocation" in hist else "target_allocation"
+    target = hist[col].dropna() if col in hist else pd.Series(dtype=float)
     allocations = np.unique(np.round(target.to_numpy(), 4)) if len(target) else np.array([0.6, 0.95, 1.1875])
     allocations = allocations[allocations > 0] if (allocations > 0).any() else np.array([1.0])
     change_prob = float((target.diff().abs() > 1e-9).mean()) if len(target) > 1 else 0.05
     change_prob = max(change_prob, 1.0 / len(index))
     rearm = frozenset(f.test_start for f in result.folds[1:])
     sims = pd.DataFrame([
-        _summary(random_allocation(bars, index, config, risk_config, allocations, change_prob, seed + i, rearm), init, rf)
+        _summary(random_allocation(bars, index, config, risk_config, allocations, change_prob, seed + i, rearm,
+                                   meta=hist), init, rf)
         for i in range(n_random)
     ])
     rows[f"Random (mean, n={n_random})"] = sims.mean().to_dict()
@@ -489,6 +502,11 @@ class PerformanceReport:
         result.trades.to_csv(paths["trade_log"], index=False)
         result.fills.to_csv(paths["fills"], index=False)
         result.regime_history.to_csv(paths["regime_history"], index_label="timestamp")
+        for name in ("risk_events", "risk_rejections"):
+            frame = getattr(result, name)
+            if frame is not None and not frame.empty:
+                paths[name] = out / f"{name}.csv"
+                frame.to_csv(paths[name], index=False)
         pd.Series(self.to_dict(), name="value").to_csv(paths["summary"], index_label="metric")
         for name, frame in (("regime_stats", self.regime_stats), ("confidence_stats", self.confidence_stats),
                             ("benchmarks", self.benchmarks)):

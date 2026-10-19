@@ -40,9 +40,11 @@ import numpy as np
 import pandas as pd
 
 from core.hmm_engine import HMMConfig, HMMEngine, RegimeState
-from core.regime_strategies import StrategyConfig, StrategyOrchestrator
-from core.risk_manager import RiskConfig, RiskManager, TradingState
-from data.feature_engineering import FeatureConfig, FeatureEngineer, log_returns, validate_bars
+from core.regime_strategies import Direction, Signal, StrategyConfig, StrategyOrchestrator
+from core.risk_manager import PositionInfo, RiskConfig, RiskManager
+from data.feature_engineering import FeatureConfig, FeatureEngineer, atr, log_returns, validate_bars
+
+SYNTHETIC_STOP_ATR = 3.0
 
 logger = logging.getLogger("regime_trader.backtest")
 
@@ -109,11 +111,14 @@ class TargetSignal:
     """Output of a signal source for one bar.
 
     ``weights`` maps symbol -> target fraction of equity (None = no opinion, hold).
-    ``meta`` is recorded verbatim in the per-bar history.
+    ``signals`` are the strategy's per-symbol signals (with stops) for the risk
+    manager; weight-only sources get synthetic ATR stops. ``meta`` is recorded
+    verbatim in the per-bar history (non-scalar values excluded).
     """
 
     weights: dict[str, float] | None
     meta: dict[str, Any] = field(default_factory=dict)
+    signals: list[Signal] | None = None
 
 
 SignalFn = Callable[[int, pd.Timestamp], TargetSignal]
@@ -131,6 +136,8 @@ class SimulationResult:
     history: pd.DataFrame
     fills: pd.DataFrame
     trades: pd.DataFrame
+    risk_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    risk_rejections: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 @dataclass
@@ -153,6 +160,8 @@ class BacktestResult:
     allocation: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
     initial_capital: float = 100_000.0
     engines: list[HMMEngine] = field(default_factory=list, repr=False)
+    risk_events: pd.DataFrame = field(default_factory=pd.DataFrame)
+    risk_rejections: pd.DataFrame = field(default_factory=pd.DataFrame)
 
 
 class Portfolio:
@@ -224,26 +233,67 @@ def align_bars(bars_by_symbol: dict[str, pd.DataFrame]) -> dict[str, pd.DataFram
     return {s: b.loc[common] for s, b in clean.items()}
 
 
-def _apply_risk(
-    weights: dict[str, float] | None,
-    state: TradingState | None,
-    current: float,
-    risk_config: RiskConfig | None,
-) -> dict[str, float] | None:
-    if weights is None or risk_config is None or state is None:
-        return weights
-    if state is TradingState.KILLED:
-        return {s: 0.0 for s in weights}
-    out = dict(weights)
-    if state is TradingState.REDUCED:
-        out = {s: w * risk_config.reduce_size_mult for s, w in out.items()}
-    gross = sum(out.values())
-    if gross > risk_config.max_leverage:
-        out = {s: w * risk_config.max_leverage / gross for s, w in out.items()}
-        gross = risk_config.max_leverage
-    if state is TradingState.HALTED and gross > current:
-        return None
+def signals_from_weights(
+    weights: dict[str, float],
+    prices: dict[str, float],
+    stops: dict[str, float],
+    ts: pd.Timestamp,
+    meta: dict[str, Any],
+) -> list[Signal]:
+    """Wrap weight-only targets (benchmarks) as LONG signals with ATR stops for the risk manager."""
+    out = []
+    for sym, w in weights.items():
+        out.append(Signal(
+            symbol=sym, direction=Direction.LONG if w > 0 else Direction.FLAT, confidence=1.0,
+            entry_price=prices[sym], stop_loss=stops[sym], take_profit=None,
+            position_size_pct=w, leverage=max(1.0, w), regime_id=int(meta.get("regime_id", -1)),
+            regime_name=str(meta.get("regime", "")), regime_probability=float(meta.get("probability", 1.0)),
+            timestamp=ts, reasoning="weight target", strategy_name="WeightTarget",
+            metadata={"target_weight": w, "vol_regime": meta.get("vol_regime", "mid"),
+                      "uncertain": bool(meta.get("uncertain", False))},
+        ))
     return out
+
+
+def _risk_gate(
+    risk: RiskManager,
+    sig: TargetSignal,
+    portfolio: Portfolio,
+    close_px: dict[str, float],
+    eq: float,
+    cur_weights: dict[str, float],
+    stops: dict[str, float],
+    synthetic_stops: dict[str, float],
+    ts: pd.Timestamp,
+    returns: pd.DataFrame | None,
+) -> tuple[dict[str, float] | None, bool, str]:
+    """Run the risk manager for one bar; return (target weights or None, force trade, state)."""
+    positions = {
+        s: PositionInfo(s, n, close_px[s], stops.get(s)) for s, n in portfolio.shares.items() if n != 0
+    }
+    state = risk.build_state(
+        eq, portfolio.cash, positions, timestamp=ts, regime=sig.meta.get("regime"),
+        flicker_rate=int(sig.meta.get("flicker_rate", 0) or 0), returns=returns,
+    )
+    status = risk.check_circuit_breakers(state)
+    if status.close_all:
+        return {s: 0.0 for s in portfolio.shares}, bool(positions), status.state.value
+    signals = sig.signals
+    if signals is None and sig.weights is not None:
+        signals = signals_from_weights(sig.weights, close_px, synthetic_stops, ts, sig.meta)
+    if not signals:
+        return None, False, status.state.value
+    target = dict(cur_weights)
+    approved = False
+    for d, s in zip(risk.validate_signals(signals, state, now=ts), signals):
+        if d.approved and d.modified_signal is not None:
+            target[s.symbol] = float(d.modified_signal.metadata["target_weight"])
+            stops[s.symbol] = s.stop_loss
+            approved = True
+    if not approved:
+        return None, False, status.state.value
+    breaker_cut = status.any_active and sum(target.values()) < sum(cur_weights.values()) - 1e-9
+    return target, breaker_cut, status.state.value
 
 
 def run_simulation(
@@ -257,8 +307,11 @@ def run_simulation(
     """Walk ``index`` bar by bar, trading on ``signal_fn`` targets.
 
     The signal at bar ``t`` (computed after the close) fills at the open of bar
-    ``t + fill_delay_bars``. ``risk_config=None`` disables the risk overlay.
-    ``rearm_at`` lists bars where a tripped kill-switch is cleared.
+    ``t + fill_delay_bars``. With ``risk_config`` every signal passes through
+    :class:`RiskManager` (absolute veto; circuit-breaker halts flatten the book);
+    ``risk_config=None`` disables it. The peak-drawdown lock is kept in memory and
+    released at the bars in ``rearm_at`` (window starts, i.e. after a model retrain),
+    standing in for the manual review required live.
     """
     symbols = list(bars_by_symbol)
     opens = {s: bars_by_symbol[s]["open"].reindex(index).to_numpy(dtype=float) for s in symbols}
@@ -267,7 +320,18 @@ def run_simulation(
         raise ValueError("bars missing for some simulation timestamps")
 
     portfolio = Portfolio(config.initial_capital, symbols)
-    risk = RiskManager(risk_config) if risk_config is not None else None
+    risk = RiskManager(risk_config, lock_path=None) if risk_config is not None else None
+    stops: dict[str, float] = {}
+    synthetic_stop = {
+        s: (b["close"] - SYNTHETIC_STOP_ATR * atr(b["high"], b["low"], b["close"], 14))
+        .reindex(index).to_numpy(dtype=float)
+        for s, b in bars_by_symbol.items()
+    }
+    returns_all = (
+        pd.DataFrame({s: b["close"] for s, b in bars_by_symbol.items()}).pct_change()
+        if risk is not None and len(symbols) > 1 else None
+    )
+    corr_window = risk_config.correlation_window if risk_config is not None else 0
     pending: list[tuple[int, dict[str, float], pd.Timestamp]] = []
     n = len(index)
     equity = np.empty(n)
@@ -301,28 +365,37 @@ def run_simulation(
             {s: (portfolio.shares[s] * close_px[s] / eq if eq > 0 else 0.0) for s in symbols}
         )
 
-        state = None
+        sig = signal_fn(pos, ts)
+        history.append({"timestamp": ts, **sig.meta})
+        force = False
         if risk is not None:
             risk.update_equity(eq, ts)
-            if ts in rearm_at:
-                risk.rearm(eq)
-            state = risk.evaluate_state(eq)
-        states.append(state.value if state is not None else "off")
-
-        sig = signal_fn(pos, ts)
-        target = _apply_risk(sig.weights, state, cur, risk_config)
+            if ts in rearm_at and risk.circuit_breaker.locked:
+                risk.release_lock(eq)
+            returns = returns_all.loc[:ts].tail(corr_window) if returns_all is not None else None
+            target, force, state_name = _risk_gate(
+                risk, sig, portfolio, close_px, eq, weights_rows[-1], stops,
+                {s: synthetic_stop[s][pos] for s in symbols}, ts, returns,
+            )
+            states.append(state_name)
+        else:
+            target = sig.weights
+            states.append("off")
         if eq <= 0 and target is not None:
             target = {s: 0.0 for s in target}
-        history.append({"timestamp": ts, **sig.meta})
         if target is None:
             continue
         gross = sum(target.values())
         target_alloc[pos] = gross
         reference = sum(pending[-1][1].values()) if pending else cur
-        force_flat = state is TradingState.KILLED and any(portfolio.shares.values()) and not pending
+        force = force and not pending
         exec_pos = pos + config.fill_delay_bars
-        if exec_pos < n and (abs(gross - reference) > config.rebalance_threshold + 1e-9 or force_flat):
+        if exec_pos < n and (abs(gross - reference) > config.rebalance_threshold + 1e-9 or force):
             pending.append((exec_pos, target, ts))
+            if risk is not None:
+                for s, w in target.items():
+                    if abs(w - weights_rows[-1].get(s, 0.0)) > 1e-9:
+                        risk.record_order(s, "buy" if w > weights_rows[-1].get(s, 0.0) else "sell", ts)
 
     equity_s = pd.Series(equity, index=index, name="equity")
     fills_df = pd.DataFrame(fills)
@@ -336,6 +409,8 @@ def run_simulation(
         history=hist_df,
         fills=fills_df,
         trades=build_trades(fills_df, equity_s, hist_df),
+        risk_events=pd.DataFrame(risk.circuit_breaker.get_history()) if risk is not None else pd.DataFrame(),
+        risk_rejections=pd.DataFrame(risk.rejections) if risk is not None else pd.DataFrame(),
     )
 
 
@@ -473,13 +548,15 @@ class RegimeSignalSource:
             "probability": state.probability,
             "in_transition": state.in_transition,
             "flickering": flicker,
+            "flicker_rate": engine.get_regime_flicker_rate(),
             "uncertain": orch.is_uncertain(state, flicker),
         }
         if not signals:
             return TargetSignal(None, {**meta, "strategy": None, "signal_allocation": np.nan})
         weights = {s.symbol: s.metadata["target_weight"] for s in signals}
-        meta.update(strategy=signals[0].strategy_name, signal_allocation=sum(weights.values()))
-        return TargetSignal(weights, meta)
+        meta.update(strategy=signals[0].strategy_name, signal_allocation=sum(weights.values()),
+                    stop_loss=signals[0].stop_loss)
+        return TargetSignal(weights, meta, signals)
 
 
 class WalkForwardBacktester:
@@ -596,6 +673,8 @@ class WalkForwardBacktester:
             allocation=sim.allocation,
             initial_capital=self.config.initial_capital,
             engines=engines,
+            risk_events=sim.risk_events,
+            risk_rejections=sim.risk_rejections,
         )
 
     def apply_slippage(self, price: float, side: str) -> float:
