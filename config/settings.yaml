@@ -118,20 +118,28 @@ risk:
   weekly_dd_halt: 0.07
   # Drawdown from equity peak that triggers full de-risking / kill switch.
   max_dd_from_peak: 0.10
+  # Target-allocation multiplier while in the REDUCED state (daily/weekly reduce thresholds).
+  reduce_size_mult: 0.50
 
 backtest:
-  # Per-side slippage as a fraction of price.
+  # Slippage per rebalance as a fraction of traded notional.
   slippage_pct: 0.0005
   # Starting equity in account currency.
   initial_capital: 100000
-  # Walk-forward initial in-sample (training) window, in bars; must be >= hmm.min_train_bars.
-  train_window: 504
+  # Walk-forward in-sample (HMM training + BIC selection) window, in bars; must be >= backtest.min_train_bars.
+  train_window: 252
+  # HMM training minimum for walk-forward fits; overrides hmm.min_train_bars (live) in the backtest only.
+  min_train_bars: 252
   # Walk-forward out-of-sample (test) window, in bars.
   test_window: 126
   # Bars to advance between walk-forward folds.
   step_size: 126
   # Annual risk-free rate used for Sharpe/Sortino.
   risk_free_rate: 0.045
+  # Signal on bar t's close fills at the open of bar t + fill_delay_bars.
+  fill_delay_bars: 1
+  # Flat commission per order (per symbol per rebalance), account currency.
+  commission_per_trade: 0.0
 
 monitoring:
   # Terminal dashboard refresh interval.
