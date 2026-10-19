@@ -87,11 +87,13 @@ class AlpacaClient:
         """Retry reads only; never replay an ambiguous order submission."""
         if self.trading is None:
             self.connect()
-        try:
-            return getattr(self.trading, method)(*args, **kwargs)
-        except (ConnectionError, TimeoutError, OSError):
-            self.connect()
-            return getattr(self.trading, method)(*args, **kwargs)
+        for attempt in range(3):
+            try:
+                return getattr(self.trading, method)(*args, **kwargs)
+            except Exception:
+                if attempt == 2:
+                    raise
+                self._sleep(2 ** attempt)
 
     def health_check(self):
         self.get_account()

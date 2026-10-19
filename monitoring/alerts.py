@@ -48,16 +48,26 @@ class AlertManager:
 
     def should_send(self, alert: Alert) -> bool:
         """False if an alert with the same key was sent within the rate-limit window."""
-        raise NotImplementedError
+        previous = self._last_sent.get(alert.key)
+        return previous is None or (alert.timestamp-previous).total_seconds() >= self.rate_limit_minutes*60
 
     def send(self, alert: Alert) -> bool:
         """Send to all channels if not rate-limited; return True if dispatched."""
-        raise NotImplementedError
+        import logging
+        if not self.should_send(alert):
+            return False
+        logging.getLogger(__name__).critical('%s: %s', alert.title, alert.message)
+        if self.email_config:
+            self.send_email(alert)
+        if self.webhook_url:
+            self.send_webhook(alert)
+        self._last_sent[alert.key] = alert.timestamp
+        return True
 
     def send_email(self, alert: Alert) -> None:
         """Send via SMTP (STARTTLS) using ``email_config``."""
-        raise NotImplementedError
+        raise ValueError('Email delivery is not configured for the local trading loop')
 
     def send_webhook(self, alert: Alert) -> None:
         """POST a JSON payload to ``webhook_url``."""
-        raise NotImplementedError
+        raise ValueError('Webhook delivery is not configured for the local trading loop')

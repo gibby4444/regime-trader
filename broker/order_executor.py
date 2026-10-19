@@ -61,10 +61,11 @@ def result(order, trade_id=''):
 
 class OrderExecutor:
     def __init__(self, client, risk, portfolio=None, *, sleep_fn=time.sleep,
-                 monotonic_fn=time.monotonic, market_retry=False):
+                 monotonic_fn=time.monotonic, market_retry=False, should_stop=None):
         self.client, self.risk, self.portfolio = client, risk, portfolio
         self._sleep, self._clock = sleep_fn, monotonic_fn
         self.market_retry = market_retry
+        self.should_stop = should_stop or (lambda: False)
         self._results = {}
         self._intents = {}
 
@@ -100,20 +101,32 @@ class OrderExecutor:
         return decision, size
 
     def _send(self, signal, *, bracket=False, qty=None, side='buy', market=False,
-              trade_id=None, client_order_id=None):
+              trade_id=None, client_order_id=None, risk_decision=None):
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
         trade_id = trade_id or signal.metadata.get('trade_id') or uuid4().hex
         client_order_id = client_order_id or trade_id
         if client_order_id in self._results:
             return self._results[client_order_id]
         signal = replace(signal, metadata={**signal.metadata, 'trade_id': trade_id})
-        decision, size = self._validate(signal, qty)
+        if risk_decision is None:
+            decision, size = self._validate(signal, qty)
+        else:
+            decision = risk_decision
+            if not decision.approved or not self.risk.can_trade():
+                raise PermissionError('Trading halted')
+            size = decision.quantity
+            if size <= 0:
+                raise ValueError('Risk-approved quantity must be positive')
         decision.trade_id = trade_id
         if bracket and (signal.take_profit is None or signal.take_profit <= signal.entry_price):
             raise ValueError('Bracket requires take profit above entry')
         if side == 'buy' and signal.stop_loss >= signal.entry_price:
             raise ValueError('Long stop must be below entry')
-        args = dict(symbol=signal.symbol, qty=size, side=side, time_in_force='day',
+        args = dict(symbol=signal.symbol, qty=size, side=side, time_in_force='gtc',
                     client_order_id=client_order_id)
+        if not bracket and side == 'buy':
+            args.update(order_class='oto', stop_loss=StopLossRequest(stop_price=signal.stop_loss))
         if bracket:
             args.update(order_class='bracket', stop_loss=StopLossRequest(stop_price=signal.stop_loss),
                         take_profit=TakeProfitRequest(limit_price=signal.take_profit))
@@ -121,14 +134,26 @@ class OrderExecutor:
                    LimitOrderRequest(**args, limit_price=round(signal.entry_price*(1.001 if side == 'buy' else .999), 2)))
         self.client.trade_context[client_order_id] = dict(trade_id=trade_id, signal=signal, risk_decision=decision)
         # No automatic retry: a timeout can mean the broker accepted the order.
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
         response = result(self.client.trading.submit_order(order_data=request), trade_id)
         self._results[client_order_id] = response
         self._intents[response.order_id] = (signal, side, size)
         self.client.trade_context[response.order_id] = self.client.trade_context[client_order_id]
         return response
 
-    def submit_order(self, signal, *, market_retry=None):
-        order = self._send(signal)
+    def submit_order(self, signal, *, market_retry=None, risk_decision=None):
+        if risk_decision is not None:
+            if not risk_decision.approved or not self.risk.can_trade():
+                raise PermissionError('Trading halted or risk decision rejected')
+            held = float(self._portfolio().positions.get(signal.symbol, {}).get('qty', 0))
+            if risk_decision.quantity < held:
+                return self.reduce_position(signal.symbol, risk_decision.quantity)
+            delta = risk_decision.quantity-held
+            if delta == 0:
+                return None
+            risk_decision = replace(risk_decision, quantity=delta)
+        order = self._send(signal, risk_decision=risk_decision)
         final = self.wait_for_fill(order.order_id)
         retry = self.market_retry if market_retry is None else market_retry
         if retry and final.status == 'canceled':
@@ -168,6 +193,8 @@ class OrderExecutor:
         return [self.submit(o) for o in orders]
 
     def modify(self, order_id, qty=None, limit_price=None, stop_price=None):
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
         old = plain(self.client.call('get_order_by_id', order_id))
         context = self.client.trade_context.get(order_id)
         if context is None:
@@ -182,6 +209,8 @@ class OrderExecutor:
         _, approved = self._validate(signal, qty or float(old['qty']))
         if qty is not None and approved < qty:
             raise PermissionError('Replacement exceeds approved quantity')
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
         response = result(self.client.trading.replace_order_by_id(order_id,
                           order_data=ReplaceOrderRequest(qty=qty, limit_price=limit_price, stop_price=stop_price)),
                           context['trade_id'])
@@ -189,6 +218,8 @@ class OrderExecutor:
         return response
 
     def modify_stop(self, symbol, new_stop):
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
         for parent in self.client.get_orders():
             for order in [parent, *(parent.get('legs') or [])]:
                 order = plain(order)
@@ -198,16 +229,45 @@ class OrderExecutor:
                         context = self.client.trade_context.get(str(parent['id']))
                         if context:
                             self.client.trade_context[key] = context
-                    return self.modify(key, stop_price=new_stop)
+                    previous = float(order['stop_price'])
+                    side = str(getattr(order['side'], 'value', order['side']))
+                    if not math.isfinite(new_stop) or new_stop <= 0:
+                        raise ValueError('Invalid stop')
+                    if (side == 'sell' and new_stop < previous) or (side == 'buy' and new_stop > previous):
+                        raise ValueError('Stop may only tighten')
+                    if self.should_stop():
+                        raise InterruptedError('Trading loop is stopping')
+                    return result(self.client.trading.replace_order_by_id(key,
+                                  order_data=ReplaceOrderRequest(stop_price=new_stop)))
         raise ValueError('No tracked stop order for symbol')
 
     def cancel_order(self, order_id):
+        if self.should_stop():
+            return
         self.client.trading.cancel_order_by_id(order_id)
 
     cancel = cancel_order
 
     def cancel_all(self):
+        if self.should_stop():
+            return
         self.client.trading.cancel_orders()
+
+    def reduce_position(self, symbol, target_quantity):
+        """Sell only the excess long shares, using the broker's actual position."""
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
+        position = next(p for p in self.client.get_positions() if p['symbol'] == symbol)
+        held = float(position['qty'])
+        if not math.isfinite(target_quantity) or not 0 <= target_quantity < held:
+            raise ValueError('Reduction must leave between zero and current shares')
+        if str(getattr(position.get('side'), 'value', position.get('side'))) == 'short':
+            raise ValueError('Long reduction cannot increase a short')
+        request = MarketOrderRequest(symbol=symbol, qty=held-target_quantity, side='sell',
+                                     time_in_force='day', client_order_id=uuid4().hex)
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
+        return result(self.client.trading.submit_order(order_data=request))
 
     def close_position(self, symbol, signal=None):
         position = next(p for p in self.client.get_positions() if p['symbol'] == symbol)
@@ -227,6 +287,8 @@ class OrderExecutor:
         context = dict(trade_id=trade_id, signal=signal, risk_decision=None)
         self.client.trade_context[trade_id] = context
         # A submission timeout must not trigger an automatic retry.
+        if self.should_stop():
+            raise InterruptedError('Trading loop is stopping')
         response = result(self.client.trading.submit_order(order_data=request), trade_id)
         self._results[trade_id] = response
         self.client.trade_context[response.order_id] = context
@@ -241,6 +303,8 @@ class OrderExecutor:
         while True:
             order = result(self.client.call('get_order_by_id', order_id), context.get('trade_id', ''))
             if order.status in ('filled', 'canceled', 'expired', 'rejected'):
+                return order
+            if self.should_stop():
                 return order
             if self._clock() >= deadline:
                 self.cancel_order(order_id)
