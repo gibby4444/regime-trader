@@ -483,12 +483,16 @@ class HMMEngine:
         loglik = 0.0
         prev = prev_log_alpha
         for t in range(log_b.shape[0]):
-            if prev is None:
-                la = log_pi + log_b[t]
-            else:
-                la = logsumexp(prev[:, None] + log_a, axis=0) + log_b[t]
+            prior = log_pi if prev is None else logsumexp(prev[:, None] + log_a, axis=0)
+            la = prior + log_b[t]
             norm = logsumexp(la)
             loglik += float(norm)
+            if not np.isfinite(norm):
+                # Observation has zero density under every state (e.g. outside a singular
+                # covariance's support after an extreme shock): treat it as uninformative.
+                logger.warning("Bar %d has zero likelihood under all states; keeping the prior", t)
+                la = prior
+                norm = logsumexp(la)
             prev = la - norm
             out[t] = prev
         return out, loglik

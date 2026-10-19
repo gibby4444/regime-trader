@@ -135,6 +135,28 @@ def test_filtered_probabilities_are_distributions(trained_engine: HMMEngine, fea
     np.testing.assert_array_equal(trained_engine.predict_regime_filtered(features), probs.to_numpy().argmax(axis=1))
 
 
+def test_zero_likelihood_bar_keeps_prior_instead_of_nan(
+    trained_engine: HMMEngine, features: pd.DataFrame, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    x = features.iloc[:30]
+    real = HMMEngine.emission_logprob
+
+    def impossible_bar_10(self: HMMEngine, arr: np.ndarray) -> np.ndarray:
+        out = real(self, arr)
+        if len(out) > 10:
+            out[10] = -np.inf
+        return out
+
+    baseline = trained_engine.predict_regime_proba(x).to_numpy()
+    monkeypatch.setattr(HMMEngine, "emission_logprob", impossible_bar_10)
+    probs = trained_engine.predict_regime_proba(x).to_numpy()
+    assert np.isfinite(probs).all()
+    np.testing.assert_allclose(probs.sum(axis=1), 1.0)
+    np.testing.assert_allclose(probs[:10], baseline[:10])
+    expected_prior = baseline[9] @ trained_engine.transmat
+    np.testing.assert_allclose(probs[10], expected_prior, atol=1e-12)
+
+
 def test_incremental_update_matches_batch(trained_engine: HMMEngine, features: pd.DataFrame) -> None:
     batch = trained_engine.predict_regime_proba(features).to_numpy()
     states = trained_engine.run_filter(features)

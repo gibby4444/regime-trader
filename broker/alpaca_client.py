@@ -6,11 +6,34 @@ selection, retries, and conversion of SDK objects to plain Python/pandas types.
 
 from __future__ import annotations
 
+import os
+import re
 from typing import Any
 
 import pandas as pd
+from alpaca.data.enums import Adjustment, DataFeed
 from alpaca.data.historical import StockHistoricalDataClient
+from alpaca.data.requests import StockBarsRequest
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
+
+_TIMEFRAME_UNITS = {
+    "min": TimeFrameUnit.Minute,
+    "minute": TimeFrameUnit.Minute,
+    "hour": TimeFrameUnit.Hour,
+    "day": TimeFrameUnit.Day,
+    "week": TimeFrameUnit.Week,
+    "month": TimeFrameUnit.Month,
+}
+
+
+def parse_timeframe(spec: str) -> TimeFrame:
+    """'1Day', '15Min', '1Hour' ... -> alpaca ``TimeFrame``."""
+    m = re.fullmatch(r"(\d+)\s*([A-Za-z]+)", spec.strip())
+    unit = _TIMEFRAME_UNITS.get(m.group(2).lower()) if m else None
+    if m is None or unit is None:
+        raise ValueError(f"Unsupported timeframe: {spec!r}")
+    return TimeFrame(int(m.group(1)), unit)
 
 
 class AlpacaClient:
@@ -27,7 +50,23 @@ class AlpacaClient:
     @classmethod
     def from_env(cls) -> AlpacaClient:
         """Build a client from ``ALPACA_API_KEY``, ``ALPACA_SECRET_KEY``, ``ALPACA_PAPER``."""
-        raise NotImplementedError
+        key, secret = os.environ.get("ALPACA_API_KEY"), os.environ.get("ALPACA_SECRET_KEY")
+        if not key or not secret:
+            raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set")
+        paper = os.environ.get("ALPACA_PAPER", "true").strip().lower() not in ("0", "false", "no")
+        return cls(key, secret, paper)
+
+    @staticmethod
+    def has_env_credentials() -> bool:
+        """True if both Alpaca key variables are set and non-placeholder."""
+        key, secret = os.environ.get("ALPACA_API_KEY", ""), os.environ.get("ALPACA_SECRET_KEY", "")
+        return bool(key and secret and "your_" not in key and "your_" not in secret)
+
+    def data_client(self) -> StockHistoricalDataClient:
+        """Historical market-data client (created on first use; no account call)."""
+        if self.data is None:
+            self.data = StockHistoricalDataClient(self.api_key, self.secret_key)
+        return self.data
 
     def connect(self) -> None:
         """Instantiate SDK clients and verify credentials via an account call."""
@@ -56,8 +95,24 @@ class AlpacaClient:
         start: pd.Timestamp,
         end: pd.Timestamp | None = None,
     ) -> pd.DataFrame:
-        """Fetch historical OHLCV bars as a (symbol, timestamp)-indexed DataFrame."""
-        raise NotImplementedError
+        """Fetch split/dividend-adjusted OHLCV bars as a (symbol, timestamp)-indexed DataFrame.
+
+        ``ALPACA_DATA_FEED`` (e.g. ``iex``) selects the feed; default is the
+        account's default (SIP for historical bars older than 15 minutes).
+        """
+        request = StockBarsRequest(
+            symbol_or_symbols=list(symbols),
+            timeframe=parse_timeframe(timeframe),
+            start=pd.Timestamp(start).to_pydatetime(),
+            end=pd.Timestamp(end).to_pydatetime() if end is not None else None,
+            adjustment=Adjustment.ALL,
+            feed=DataFeed(os.environ["ALPACA_DATA_FEED"].lower()) if os.environ.get("ALPACA_DATA_FEED") else None,
+        )
+        df = self.data_client().get_stock_bars(request).df
+        if df.empty:
+            return df
+        cols = ["open", "high", "low", "close", "volume"]
+        return df[cols].sort_index()
 
     def get_latest_quotes(self, symbols: list[str]) -> dict[str, dict[str, float]]:
         """Return latest bid/ask per symbol."""
