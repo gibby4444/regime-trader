@@ -6,7 +6,7 @@ broker:
   # Use Alpaca paper trading endpoint. Set false only for live capital.
   paper_trading: true
   # Universe of tradable symbols.
-  symbols: [SPY, QQQ, AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, AMD]
+  symbols: [SPY, QQQ, AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, AMD, SOXL]
   # Bar timeframe used for features, HMM fitting, and rebalancing (Alpaca TimeFrame string).
   timeframe: 1Day
   # Completed live bars; model training continues to use daily history.
