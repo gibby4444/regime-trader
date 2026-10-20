@@ -154,11 +154,31 @@ def test_loader_is_read_only_and_missing_tables_are_safe(monkeypatch):
         return Connection()
     monkeypatch.setenv('DATABASE_URL', 'test-only')
     monkeypatch.setattr(psycopg, 'connect', connect)
-    assert module.load_data() == ({'data': {'running': False}}, [], [], [])
+    assert module.load_data() == ({'data': {'running': False}}, [], [], [], [])
     assert options[0]['connect_timeout'] == 5
     assert 'default_transaction_read_only=on' in options[0]['options']
     assert all(sql.startswith('SELECT ') for sql in queries)
     def missing(*args):
         raise RuntimeError('table missing')
     monkeypatch.setattr(Connection, 'execute', missing)
-    assert module.load_data() == (None, [], [], [])
+    assert module.load_data() == (None, [], [], [], [])
+
+
+def test_intended_orders_midnight_and_rendering():
+    now = datetime(2026, 10, 20, 6, 1, tzinfo=timezone.utc)
+    base = dict(symbol='<SPY>', side='buy', original_qty=100, final_qty=40,
+                notional=4004, price=100.1, stop_price=95, regime='weak bull',
+                outcome='shrunk', reason='weight cap', dry_run=True, sent=False)
+    rows = [dict(base, ts=now-timedelta(minutes=2)), dict(base, ts=now)]
+    result = module.build_view(None, [], [], [], now, rows)
+    assert len(result['would_trade_today']) == len(result['order_history']) == 1
+    row = result['would_trade_today'][0]
+    assert row['shares'] == '100 → 40 shares'
+    assert row['label'] == 'Dry run: not sent'
+    assert row['mood'] == 'Mild uptrend'
+    assert row['price'] == 'Limit $100.10'
+    markup = module.render(result)
+    assert '&lt;SPY&gt;' in markup and '<SPY>' not in markup
+    assert 'Dry run: not sent' in markup
+    assert 'overflow-x:auto' in markup
+    assert 'No trades wanted yet today.' in module.render(view())
