@@ -40,8 +40,12 @@ class MarketDataFeed:
         return self.client.data
 
     def _historical(self, symbols, period, start, end=None):
+        import os
+        from alpaca.data.enums import DataFeed
+        feed = os.environ.get('ALPACA_DATA_FEED')
         response = self._data().get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbols, timeframe=timeframe(period), start=start, end=end))
+            symbol_or_symbols=symbols, timeframe=timeframe(period), start=start, end=end,
+            feed=DataFeed(feed.lower()) if feed else None))
         return response.df
 
     def get_historical_bars(self, symbol, timeframe, start, end=None):
