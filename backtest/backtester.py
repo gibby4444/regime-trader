@@ -54,6 +54,7 @@ class BacktestResult:
         path.mkdir(parents=True, exist_ok=True)
         self.equity_curve.to_csv(path/'equity_curve.csv')
         self.trades.to_csv(path/'trade_log.csv', index=False)
+        self.weights.to_csv(path/'weights.csv')
         self.regime_history.to_csv(path/'regime_history.csv')
 
 class WalkForwardBacktester:
@@ -192,10 +193,16 @@ class WalkForwardBacktester:
                     if desired < shares[s]:
                         execute(s,desired,price,ts,'rebalance')
                     else:
+                        # Reject an already triggered long stop, including overnight gaps.
+                        if signal.stop_loss is not None and signal.stop_loss >= price:
+                            continue
                         decision = risk.validate_signal(signal,account)
                         if decision.approved:
+                            old_shares = shares[s]
                             execute(s,min(desired,decision.quantity),price,ts,'rebalance',dict(regime=signal.regime_name,confidence=signal.confidence))
-                            stops[s] = signal.stop_loss
+                            if shares[s] > old_shares:
+                                # An add may tighten, but cannot widen an existing stop.
+                                stops[s] = max(stops[s], signal.stop_loss) if old_shares else signal.stop_loss
                 pending = []
             if mode not in ('buy_hold','sma200'):
                 for s in shares:

@@ -194,3 +194,63 @@ def test_daily_close_halt_survives_session_reset_until_liquidation(backtester,ba
     result=backtester.run({'SPY':b})
     exits=result.trades[(result.trades.reason=='circuit_breaker')&(result.trades.timestamp==b.index[26])]
     assert not exits.empty
+
+
+@pytest.mark.parametrize('stop,entry_open,expected', [
+    (100, 100, 'reject'), (101, 100, 'reject'), (None, 100, 'reject'),
+    (99, 98, 'reject'),  # valid at signal close, invalid after next-open gap
+    (100.02, 100, 'reject'),  # below slipped fill, still above executable open
+    (99.5, 100, 'stop'), (98, 100, 'hold'),
+])
+def test_entry_stop_ordering(backtester, bars, monkeypatch, stop, entry_open, expected):
+    b = bars['SPY'].copy()
+    b[['open', 'close']] = 100.
+    b['high'], b['low'] = 101., 99.
+    first_fill = b.index[14]
+    b.loc[first_fill, 'open'] = entry_open
+    b.loc[first_fill, 'low'] = min(99., entry_open - 1)
+    original = StrategyOrchestrator.generate_signals
+
+    def signals(self, *args, **kwargs):
+        return [replace(s, stop_loss=stop) for s in original(self, *args, **kwargs)
+                if s.timestamp == b.index[13]]
+
+    monkeypatch.setattr(StrategyOrchestrator, 'generate_signals', signals)
+    result = backtester.run({'SPY': b})
+    if expected == 'reject':
+        assert result.trades.empty
+    elif expected == 'stop':
+        assert list(result.trades.side) == ['buy', 'sell']
+        assert (result.trades.timestamp == first_fill).all()
+        assert result.trades.iloc[-1].price == pytest.approx(stop * .9995)
+    else:
+        assert list(result.trades.side) == ['buy']
+
+
+@pytest.mark.parametrize('add', [False, True])
+def test_standing_stop_changes_only_on_fill_and_never_widens(backtester, bars, monkeypatch, add):
+    b = bars['SPY'].copy()
+    b[['open', 'close']] = 100.
+    b['high'], b['low'] = 101., 99.
+    original = StrategyOrchestrator.generate_signals
+
+    def signals(self, *args, **kwargs):
+        result = []
+        for s in original(self, *args, **kwargs):
+            if s.timestamp not in (b.index[13], b.index[14]):
+                continue
+            first = s.timestamp == b.index[13]
+            result.append(replace(s, stop_loss=98 if first else (97 if add else 99.5),
+                                  metadata={**s.metadata, 'target_weight': .05 if first and add else .15}))
+        return result
+
+    monkeypatch.setattr(StrategyOrchestrator, 'generate_signals', signals)
+    monkeypatch.setattr(StrategyOrchestrator, 'needs_rebalance', lambda *args: True)
+    if add:
+        b.loc[b.index[16], 'low'] = 97.5
+    result = backtester.run({'SPY': b})
+    if add:
+        assert list(result.trades.side) == ['buy', 'buy', 'sell']
+        assert result.trades.iloc[-1].price == pytest.approx(98 * .9995)
+    else:
+        assert list(result.trades.side) == ['buy']

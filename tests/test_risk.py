@@ -159,3 +159,11 @@ def test_breaker_update_actual_currency_pnl(risk,account):
     account.daily_pnl=-4000
     assert risk.breaker.update(account,regime='BULL')==TradingState.HALTED
     assert risk.breaker.get_history()[-1]['drawdown']==pytest.approx(4000/104000)
+
+
+@pytest.mark.parametrize('stop', [100, 101])
+def test_long_stop_must_be_below_entry(risk, account, signal, stop):
+    decision = risk.validate_signal(replace(signal, stop_loss=stop), account)
+    assert not decision.approved
+    assert decision.rejection_reason == 'stop_not_below_entry'
+    assert risk.position_size(100000, 100, stop) == 0

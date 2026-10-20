@@ -183,7 +183,7 @@ class RiskManager:
         return self.state
 
     def position_size(self, equity, entry_price, stop_price, regime_max=1., overnight=False):
-        if not stop_price or not all(math.isfinite(x) and x > 0 for x in (equity, entry_price, stop_price)) or entry_price == stop_price:
+        if not stop_price or not all(math.isfinite(x) and x > 0 for x in (equity, entry_price, stop_price)) or stop_price >= entry_price:
             return 0
         distance = abs(entry_price-stop_price)
         qty = min(equity*self.config.max_risk_per_trade/distance,
@@ -227,6 +227,8 @@ class RiskManager:
             return reject('missing_stop_loss')
         if signal.entry_price <= 0 or not math.isfinite(signal.entry_price):
             return reject('invalid_price')
+        if signal.stop_loss >= signal.entry_price:
+            return reject('stop_not_below_entry')
         quote = quote or signal.metadata.get('quote', {})
         if not quote.get('tradeable', True):
             return reject('not_tradeable')
