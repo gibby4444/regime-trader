@@ -21,6 +21,7 @@ import pandas as pd
 from core.hmm_engine import HMMEngine, RegimeState
 from core.risk_manager import PortfolioState, TradingState
 from monitoring.dashboard import DashboardState
+from monitoring.status_store import NullStatusStore
 from monitoring.alerts import Alert, AlertSeverity
 from monitoring.logger import get_logger, log_event
 
@@ -43,7 +44,10 @@ class TradingLoop:
     def __init__(self, config, *, client, feed, engine, features, strategy, risk,
                  tracker, executor, dashboard, alerts, train, now=None,
                  sleep=time.sleep, dry_run=False, model_path='models/hmm.pkl',
-                 snapshot_path='state_snapshot.json', output=print, warm_history=None):
+                 snapshot_path='state_snapshot.json', output=print, warm_history=None, status_store=None):
+        self.status_store = status_store if status_store is not None else NullStatusStore()
+        self.started_at = (now or (lambda: datetime.now(timezone.utc)))().isoformat()
+        self._status_data = {}
         self.config = config
         self.warm_history = warm_history
         self.client, self.feed, self.engine = client, feed, engine
@@ -73,6 +77,18 @@ class TradingLoop:
         self.counts = dict(bars=0, approved=0, modified=0, rejected=0)
         self.started_resources = []
         self.executor.should_stop = lambda: self.stopping
+
+    def status_call(self, method, *args, **kwargs):
+        try:
+            getattr(self.status_store, method)(*args, **kwargs)
+        except Exception:
+            log.debug('Monitoring update failed')
+
+    def market_closed(self, clock):
+        message = f"Market closed. Next open: {clock.get('next_open', 'unknown')}"
+        self.output(message)
+        self.status_call('record_event', 'market_closed', message)
+        self.status_call('update_status', dict(self._status_data, running=False), force=True)
 
     def read(self, operation):
         from broker.alpaca_client import AlpacaClient
@@ -130,6 +146,7 @@ class TradingLoop:
 
     def startup(self):
         self.read(self.client.connect)
+        self.status_call('record_event', 'start', 'Bot connected')
         account = self.read(self.client.get_account)
         if account.get('trading_blocked') or account.get('account_blocked'):
             raise PermissionError('Alpaca account is blocked')
@@ -137,7 +154,7 @@ class TradingLoop:
             raise ValueError('Account equity must be positive')
         clock = self.read(self.client.get_clock)
         if not clock['is_open']:
-            self.output(f"Market closed. Next open: {clock.get('next_open', 'unknown')}")
+            self.market_closed(clock)
             return False
         self.ensure_model()
         self.portfolio.equity = float(account['equity'])
@@ -158,10 +175,10 @@ class TradingLoop:
         self.feed.start_stream()
         self.started_resources.append(self.dashboard.stop)
         self.dashboard.start()
+        self.online = True
         self.refresh()
         self.output(f'System online: equity={self.portfolio.equity:.2f}, dry_run={self.dry_run}')
         log.info('System online')
-        self.online = True
         return True
 
     def enqueue_bar(self, symbol, bar):
@@ -226,6 +243,7 @@ class TradingLoop:
                 try:
                     previous_regime = self.last_regime
                     self.last_regime = self.engine.update(frame.iloc[-1], stamp)
+                    self.status_call('record_regime', self.last_regime.label, self.last_regime.probability)
                     if previous_regime is not None and previous_regime.label != self.last_regime.label:
                         self.emit_alert('regime_change', f'{previous_regime.label} → {self.last_regime.label}', AlertSeverity.INFO)
                     log_event(get_logger('regime'), 'Regime prediction', **self.monitoring_context())
@@ -242,11 +260,13 @@ class TradingLoop:
                     if not allowed_before or not self.entries_allowed():
                         log.info('rejected %s: trading halted', proposed.symbol)
                         self.counts['rejected'] += 1
+                        self.status_call('record_decision', proposed.symbol, 'rejected', 'trading halted', self.last_regime.label, self.last_regime.probability)
                         continue
                     decision = self.risk.validate_signal(proposed, self.portfolio)
                     status = ('modified' if decision.modifications else 'approved') if decision.approved else 'rejected'
                     self.counts[status] += 1
                     detail = decision.modifications or decision.rejection_reason or 'risk approved'
+                    self.status_call('record_decision', proposed.symbol, status, detail, self.last_regime.label, self.last_regime.probability)
                     self.recent_signals.append(f'{self.now():%H:%M} │ {proposed.symbol} │ {status} │ {detail}')
                     log_event(get_logger('trades'), 'Signal decision', symbol=proposed.symbol,
                               status=status, detail=detail, **self.monitoring_context())
@@ -283,7 +303,7 @@ class TradingLoop:
             self.emit_alert('large_pnl', f'Daily P&L: {self.portfolio.daily_pnl:+.2f}')
         log_event(get_logger('main'), 'Portfolio snapshot', **self.monitoring_context())
         gross = sum(abs(p.get('market_value', 0)) for p in self.portfolio.positions.values())
-        self.dashboard.update(DashboardState(
+        state = DashboardState(
             regime=self.last_regime.label if self.last_regime else 'unknown',
             confidence=self.last_regime.probability if self.last_regime else 0,
             equity=self.portfolio.equity, daily_pnl=self.portfolio.daily_pnl,
@@ -300,7 +320,18 @@ class TradingLoop:
             paper=self.config['broker'].get('paper_trading', True), recent_events=list(self.recent_signals),
             drawdown=self.risk.drawdown_from_peak(self.portfolio.equity),
             target_weights=dict(self.target_weights),
-            positions=[dict(symbol=s, **p) for s, p in self.portfolio.positions.items()]))
+            positions=[dict(symbol=s, **p) for s, p in self.portfolio.positions.items()])
+        self.dashboard.update(state)
+        try:
+            self._status_data = asdict(state)
+            self._status_data.update(running=self.online and not self.stopping, dry_run=self.dry_run,
+                                     counts=dict(self.counts), symbols=list(self.symbols), started_at=self.started_at,
+                                     positions=[dict(symbol=s, qty=p.get('qty', 0), market_value=p.get('market_value', 0))
+                                                for s, p in self.portfolio.positions.items()])
+            self._status_data.pop('recent_events', None)
+            self.status_call('update_status', self._status_data)
+        except Exception:
+            log.debug('Status snapshot failed')
 
     def save_snapshot(self):
         risk = {k: getattr(self.risk, k) for k in
@@ -390,8 +421,14 @@ class TradingLoop:
             except Exception:
                 log.exception('Error closing stream/dashboard')
         self.started_resources.clear()
-        self.save_snapshot()
-        self.output(f'Session summary: {self.counts}; equity={self.portfolio.equity:.2f}')
+        summary = f'Session summary: {self.counts}; equity={self.portfolio.equity:.2f}'
+        try:
+            self.save_snapshot()
+            self.output(summary)
+        finally:
+            self.status_call('update_status', dict(self._status_data, running=False, counts=dict(self.counts)), force=True)
+            self.status_call('record_event', 'stop', summary)
+            self.status_call('close')
 
     def run(self, *, install_signals=True):
         previous = {}
@@ -408,7 +445,7 @@ class TradingLoop:
                 except Empty:
                     clock = self.read(self.client.get_clock)
                     if not clock['is_open']:
-                        self.output(f"Market closed. Next open: {clock.get('next_open', 'unknown')}")
+                        self.market_closed(clock)
                         break
                     thread = getattr(self.feed, '_thread', None)
                     stale = any(self.now()-self.last_seen.get(s, self.feed_started_at) > timedelta(minutes=10) for s in self.symbols)
@@ -419,13 +456,15 @@ class TradingLoop:
                     continue
                 clock = self.read(self.client.get_clock)
                 if not clock['is_open']:
-                    self.output(f"Market closed. Next open: {clock.get('next_open', 'unknown')}")
+                    self.market_closed(clock)
                     break
                 self.process_bar(symbol, bar)
-        except InterruptedError:
+        except InterruptedError as exc:
             if not self.stopping:
+                self.status_call('record_event', 'error', f'{type(exc).__name__}: {exc}'[:500])
                 raise
         except Exception as exc:
+            self.status_call('record_event', 'error', f'{type(exc).__name__}: {exc}'[:500])
             log.exception('Unhandled trading loop exception')
             try:
                 self.save_snapshot()

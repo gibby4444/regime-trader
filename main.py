@@ -85,6 +85,7 @@ def build_live_loop(config, *, dry_run=False):
     from core.regime_strategies import StrategyOrchestrator, StrategyConfig
     from core.risk_manager import RiskManager, RiskConfig, PortfolioState
     from core.trading_loop import TradingLoop, retry_api
+    from monitoring.status_store import StatusStore
     from monitoring.dashboard import Dashboard
     from monitoring.alerts import AlertManager
     import time
@@ -124,7 +125,7 @@ def build_live_loop(config, *, dry_run=False):
                        executor=OrderExecutor(client, risk, portfolio), dashboard=Dashboard(monitoring.get('dashboard_refresh_seconds', 5)),
                        alerts=AlertManager(monitoring.get('alert_rate_limit_minutes', 15),
                                            monitoring.get('email'),
-                                           webhook.get('url') if webhook.get('enabled', False) else None), train=train, dry_run=dry_run, warm_history=warm_history)
+                                           webhook.get('url') if webhook.get('enabled', False) else None), train=train, dry_run=dry_run, warm_history=warm_history, status_store=StatusStore())
 
 
 def main(argv=None):

@@ -13,3 +13,4 @@ schedule
 rich
 yfinance
 pytest
+psycopg[binary]
