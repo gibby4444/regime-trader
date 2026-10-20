@@ -1,0 +1,179 @@
+# regime-trader configuration
+# All tunable parameters live here, grouped by subsystem.
+# Credentials do NOT belong in this file; see config/credentials.yaml.example and .env.example.
+
+broker:
+  # Use Alpaca paper trading endpoint. Set false only for live capital.
+  paper_trading: true
+  # Universe of tradable symbols.
+  symbols: [SPY, QQQ, AAPL, MSFT, AMZN, GOOGL, NVDA, META, TSLA, AMD, SOXL]
+  # Bar timeframe used for features, HMM fitting, and rebalancing (Alpaca TimeFrame string).
+  timeframe: 1Day
+  # Completed live bars; model training continues to use daily history.
+  live_timeframe: 5Min
+
+hmm:
+  # The HMM is a volatility classifier (calm/moderate/turbulent), not a direction forecaster.
+  # Candidate numbers of hidden states; lowest BIC wins.
+  n_candidates: [3, 4, 5, 6, 7]
+  # Random restarts per candidate fit; best log-likelihood kept.
+  n_init: 10
+  # Gaussian emission covariance type: full | diag | spherical | tied.
+  covariance_type: full
+  # Max EM iterations and convergence tolerance per fit.
+  n_iter: 100
+  tol: 0.0001
+  # Floor added to covariance diagonals for numerical stability.
+  min_covar: 0.001
+  # Base seed; init i uses random_state + i. null = non-deterministic.
+  random_state: 42
+  # Minimum number of (post-warm-up) feature bars required to train (~1 trading year).
+  min_train_bars: 252
+  # Expanding-window retrain every N new bars.
+  retrain_interval_bars: 21
+  # A new regime must persist this many consecutive bars before it is confirmed.
+  stability_bars: 3
+  # Lookback window (bars) for counting regime switches ("flicker").
+  flicker_window: 20
+  # If regime switches within flicker_window exceed this, treat regime as uncertain.
+  flicker_threshold: 4
+  # Minimum posterior probability of the most likely state to consider the regime confident.
+  min_confidence: 0.55
+  # Size multiplier while a regime change is pending confirmation (previous regime held).
+  transition_size_mult: 0.75
+
+features:
+  # Log-return lookbacks (bars).
+  return_windows: [1, 5, 20]
+  # Realized-volatility window; vol ratio = vol(vol_ratio_short) / vol(vol_window).
+  vol_window: 20
+  vol_ratio_short: 5
+  # Volume z-score lookback.
+  volume_window: 50
+  # Volume trend = slope of this SMA of volume.
+  volume_sma_window: 10
+  # Bars over which SMA slopes are measured.
+  slope_lookback: 5
+  adx_window: 14
+  # Trend slope SMA.
+  trend_sma_window: 50
+  rsi_window: 14
+  # Distance-from-SMA window (as % of price).
+  long_sma_window: 200
+  roc_windows: [10, 20]
+  atr_window: 14
+  # Rolling z-score lookback applied to every feature (backward-looking only).
+  zscore_window: 252
+
+strategy:
+  # Target gross allocation (fraction of equity) in the low-volatility regime.
+  low_vol_allocation: 0.95
+  # Mid-volatility regime allocation when trend filter is positive.
+  mid_vol_allocation_trend: 0.95
+  # Mid-volatility regime allocation when trend filter is negative/flat.
+  mid_vol_allocation_no_trend: 0.60
+  # High-volatility regime allocation.
+  high_vol_allocation: 0.60
+  # Leverage multiplier applied in the low-volatility regime (capped by risk.max_leverage).
+  low_vol_leverage: 1.25
+  # Only rebalance when |target - current| gross exposure (size x leverage) exceeds this.
+  rebalance_threshold: 0.10
+  # Size multiplier when uncertain (prob < hmm.min_confidence or flickering); also forces 1.0x.
+  # Multiplies with hmm.transition_size_mult during a pending transition (0.50 x 0.75 = 0.375).
+  uncertainty_size_mult: 0.50
+  # Trend filter / stop anchor EMA and ATR windows.
+  ema_window: 50
+  atr_window: 14
+  # Low vol stop = max(price - low_vol_atr_stop_mult*ATR, EMA - low_vol_ema_atr_mult*ATR).
+  low_vol_atr_stop_mult: 3.0
+  low_vol_ema_atr_mult: 0.5
+  # Mid vol stop = EMA - mid_vol_ema_atr_mult*ATR.
+  mid_vol_ema_atr_mult: 0.5
+  # High vol stop = EMA - high_vol_ema_atr_mult*ATR.
+  high_vol_ema_atr_mult: 1.0
+  # Vol-rank position = rank / (n_regimes - 1): <= low cutoff -> LowVol, >= high cutoff -> HighVol.
+  low_vol_rank_cutoff: 0.33
+  high_vol_rank_cutoff: 0.67
+
+risk:
+  # Max fraction of equity risked on a single trade (stop-distance based sizing).
+  max_risk_per_trade: 0.01
+  # Hard maximum gross exposure as a fraction of equity. 0.80 is the course value.
+  max_exposure: 0.80
+  # Hard cap on gross leverage.
+  max_leverage: 1.25
+  # Max weight of any single position.
+  max_single_position: 0.15
+  # Positions without sector metadata share the conservative "unknown" bucket.
+  max_sector_exposure: 0.30
+  # Persistent peak-drawdown halt; remove manually only after incident review.
+  lock_path: trading_halted.lock
+  # Minimum order notional in account currency.
+  min_position: 100
+  # Overnight gap risk = shares * stop distance * gap_multiple.
+  gap_multiple: 3
+  max_gap_risk: 0.02
+  # Reject bid/ask spreads at or above this fraction of mid-price.
+  max_spread: 0.005
+  # Same symbol/direction cooldown after risk approval, in seconds.
+  duplicate_seconds: 60
+  # Pairwise trailing return correlations: reduce/reject above these thresholds.
+  correlation_window: 60
+  correlation_reduce: 0.7
+  correlation_reject: 0.85
+  min_confidence: 0.55
+  flicker_threshold: 4
+  # Max number of concurrently open positions.
+  max_concurrent: 5
+  # Max number of orders submitted per trading day.
+  max_daily_trades: 20
+  # Daily drawdown at which exposure is reduced.
+  daily_dd_reduce: 0.02
+  # Daily drawdown at which new trading is halted for the day.
+  daily_dd_halt: 0.03
+  # Weekly drawdown at which exposure is reduced.
+  weekly_dd_reduce: 0.05
+  # Weekly drawdown at which new trading is halted for the week.
+  weekly_dd_halt: 0.07
+  # Drawdown from equity peak that triggers full de-risking / kill switch.
+  max_dd_from_peak: 0.10
+
+backtest:
+  # Per-side slippage as a fraction of price.
+  slippage_pct: 0.0005
+  # Starting equity in account currency.
+  initial_capital: 100000
+  # Walk-forward initial in-sample (training) window, in bars; must be >= hmm.min_train_bars.
+  train_window: 252
+  # Walk-forward out-of-sample (test) window, in bars.
+  test_window: 126
+  # Bars to advance between walk-forward folds.
+  step_size: 126
+  # Annual risk-free rate used for Sharpe/Sortino.
+  risk_free_rate: 0.045
+  # Benchmark trial count, stress trial count and shock dates per trial.
+  random_seeds: 100
+  stress_simulations: 100
+  stress_points: 10
+  # Fixed account-currency cost per simulated fill.
+  commission: 0.0
+
+monitoring:
+  # Terminal dashboard refresh interval.
+  dashboard_refresh_seconds: 5
+  # Minimum minutes between repeated alerts of the same type.
+  alert_rate_limit_minutes: 15
+  log_dir: logs
+  # Alert when absolute daily P&L reaches this fraction of starting equity.
+  large_pnl_fraction: 0.02
+  email:
+    enabled: false
+    host: ''
+    port: 587
+    sender: ''
+    recipient: ''
+    username: ''
+    password_env: ALERT_SMTP_PASSWORD
+  webhook:
+    enabled: false
+    url: ''

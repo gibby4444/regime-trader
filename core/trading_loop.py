@@ -1,0 +1,507 @@
+"""Live lifecycle with injected broker, streams, wall clock and sleeper.
+
+Callbacks only enqueue events; all portfolio/order mutations run on the owner thread.
+"""
+from __future__ import annotations
+
+import copy
+import json
+import logging
+import math
+import signal
+import time
+from collections import deque
+from dataclasses import asdict
+from datetime import datetime, timedelta, timezone, date
+from pathlib import Path
+from queue import Queue, Empty
+
+import numpy as np
+import pandas as pd
+
+from core.hmm_engine import HMMEngine, RegimeState
+from core.risk_manager import PortfolioState, TradingState, RiskDecision
+from monitoring.dashboard import DashboardState
+from monitoring.status_store import NullStatusStore
+from monitoring.alerts import Alert, AlertSeverity
+from monitoring.logger import get_logger, log_event
+
+log = logging.getLogger(__name__)
+WEEK = timedelta(days=7)
+
+
+def retry_api(operation, sleep, attempts=3):
+    """Three attempts for reads; writes must use broker idempotency/reconciliation."""
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            sleep(2 ** attempt)
+
+
+class TradingLoop:
+    def __init__(self, config, *, client, feed, engine, features, strategy, risk,
+                 tracker, executor, dashboard, alerts, train, now=None,
+                 sleep=time.sleep, dry_run=False, model_path='models/hmm.pkl',
+                 snapshot_path='state_snapshot.json', output=print, warm_history=None, status_store=None):
+        self.status_store = status_store if status_store is not None else NullStatusStore()
+        self.started_at = (now or (lambda: datetime.now(timezone.utc)))().isoformat()
+        self._status_data = {}
+        self.config = config
+        self.warm_history = warm_history
+        self.client, self.feed, self.engine = client, feed, engine
+        self.features, self.strategy, self.risk = features, strategy, risk
+        self.tracker, self.executor = tracker, executor
+        self.dashboard, self.alerts, self.train = dashboard, alerts, train
+        self.now = now or (lambda: datetime.now(timezone.utc))
+        self.sleep, self.dry_run, self.output = sleep, dry_run, output
+        self.model_path, self.snapshot_path = Path(model_path), Path(snapshot_path)
+        self.symbols = config['broker']['symbols']
+        self.timeframe = config['broker'].get('live_timeframe', '5Min')
+        self.portfolio = tracker.portfolio
+        self.queue = Queue()
+        self.running = self.online = False
+        self.stopping = False
+        self.api_ok = True
+        self.api_latency_ms = 0
+        self.recent_signals = deque(maxlen=5)
+        self.feed_ok = True
+        self.last_regime = None
+        self.last_prediction = None
+        self.trained_at = None
+        self.bars = {}
+        self.last_seen = {}
+        self.exit_pending = set()
+        self.target_weights = {}
+        self.counts = dict(bars=0, approved=0, modified=0, rejected=0)
+        self.started_resources = []
+        self.executor.should_stop = lambda: self.stopping
+
+    def status_call(self, method, *args, **kwargs):
+        try:
+            getattr(self.status_store, method)(*args, **kwargs)
+        except Exception:
+            log.debug('Monitoring update failed')
+
+    def intended_order(self, proposed, decision):
+        """Describe the desired delta using local state only; never veto trading."""
+        try:
+            chosen = decision.modified_signal or proposed
+            entry = chosen.entry_price
+            held = float(self.portfolio.positions.get(proposed.symbol, {}).get('qty', 0))
+            weight = proposed.metadata.get('target_weight', proposed.position_size_pct * proposed.leverage)
+            original = max(0, math.floor(weight * self.portfolio.equity / entry)) - held
+            final = decision.quantity - held if decision.approved else 0
+            if not original and not final and decision.approved:
+                return
+            side = 'buy' if (final or original) >= 0 else 'sell'
+            price = round(entry * (1.001 if side == 'buy' else .999), 2)
+            outcome = ('shrunk' if decision.modifications or abs(final) < abs(original) else 'approved') if decision.approved else 'rejected'
+            self.status_call('record_intended_order', symbol=proposed.symbol, side=side,
+                             original_qty=abs(original), final_qty=abs(final), price=price,
+                             order_type='limit', stop_price=chosen.stop_loss,
+                             notional=abs(final or original) * price,
+                             regime=self.last_regime.label, confidence=self.last_regime.probability,
+                             outcome=outcome, reason=str(decision.modifications or decision.rejection_reason or 'risk approved'),
+                             dry_run=self.dry_run,
+                             sent=bool(decision.approved and self.entries_allowed() and not self.dry_run))
+        except Exception:
+            log.debug('Intended order monitoring failed')
+
+    def market_closed(self, clock):
+        message = f"Market closed. Next open: {clock.get('next_open', 'unknown')}"
+        self.output(message)
+        self.status_call('record_event', 'market_closed', message)
+        self.status_call('update_status', dict(self._status_data, running=False), force=True)
+
+    def read(self, operation):
+        from broker.alpaca_client import AlpacaClient
+        started = time.perf_counter()
+        try:
+            result = operation() if isinstance(getattr(operation, '__self__', None), AlpacaClient) else retry_api(operation, self.sleep)
+            self.api_ok = True
+            return result
+        except Exception:
+            self.api_ok = False
+            self.emit_alert('api_lost', 'Broker API connection lost', AlertSeverity.CRITICAL)
+            raise
+        finally:
+            self.api_latency_ms = (time.perf_counter()-started)*1000
+
+    def monitoring_context(self):
+        return dict(regime=self.last_regime.label if self.last_regime else 'unknown',
+                    probability=self.last_regime.probability if self.last_regime else 0,
+                    equity=self.portfolio.equity, positions=copy.deepcopy(self.portfolio.positions),
+                    daily_pnl=self.portfolio.daily_pnl)
+
+    def emit_alert(self, key, message, severity=AlertSeverity.WARNING):
+        try:
+            self.alerts.send(Alert(key, severity, key.replace('_', ' ').title(), message,
+                                   self.now(), self.monitoring_context()))
+        except Exception:
+            log.error('Alert delivery failed for %s', key)
+
+
+    def entries_allowed(self):
+        return (not self.stopping and not Path(self.risk.config.lock_path).exists()
+                and self.risk.state not in (TradingState.HALTED, TradingState.KILLED)
+                and self.risk.can_trade())
+
+    def ensure_model(self):
+        if self.trained_at is None and self.model_path.exists():
+            self.trained_at = datetime.fromtimestamp(self.model_path.stat().st_mtime, timezone.utc)
+            metadata_path = self.model_path.with_suffix(self.model_path.suffix + '.json')
+            if metadata_path.exists():
+                metadata = json.loads(metadata_path.read_text())
+                if metadata.get('training_date'):
+                    self.trained_at = pd.Timestamp(metadata['training_date']).to_pydatetime()
+            if self.now() - self.trained_at <= WEEK:
+                self.engine = HMMEngine.load(self.model_path)
+        if self.trained_at is None or self.now() - self.trained_at > WEEK:
+            # Train callback supplies daily, completed history, independently of live bars.
+            self.train(self.engine)
+            self.last_regime = None
+            self.last_prediction = None
+            self.trained_at = self.now()
+            self.engine.metadata['training_date'] = self.trained_at.isoformat()
+            self.engine.save(self.model_path)
+            self.emit_alert("hmm_retrained", "HMM training completed", AlertSeverity.INFO)
+        self.strategy.update_regimes(self.engine.regime_info)
+
+    def startup(self):
+        self.read(self.client.connect)
+        self.status_call('record_event', 'start', 'Bot connected')
+        account = self.read(self.client.get_account)
+        if account.get('trading_blocked') or account.get('account_blocked'):
+            raise PermissionError('Alpaca account is blocked')
+        if float(account['equity']) <= 0:
+            raise ValueError('Account equity must be positive')
+        clock = self.read(self.client.get_clock)
+        if not clock['is_open']:
+            self.market_closed(clock)
+            return False
+        self.ensure_model()
+        self.portfolio.equity = float(account['equity'])
+        self.portfolio.cash = float(account['cash'])
+        self.portfolio.buying_power = float(account['buying_power'])
+        self.risk.update_equity(self.portfolio.equity, self.now())
+        self.read(self.tracker.sync)
+        self.restore_snapshot()
+        self.check_breaker(execute=False)
+        self.output(f'Entries enabled: {self.entries_allowed()}')
+        self.started_resources.append(self.tracker.stop)
+        self.tracker.start()
+        if self.warm_history is not None:
+            self.bars = self.read(self.warm_history)
+        self.feed_started_at = self.now()
+        self.feed.subscribe_bars(self.symbols, self.timeframe, self.enqueue_bar)
+        self.started_resources.append(self.feed.stop_stream)
+        self.feed.start_stream()
+        self.started_resources.append(self.dashboard.stop)
+        self.dashboard.start()
+        self.online = True
+        self.refresh()
+        self.output(f'System online: equity={self.portfolio.equity:.2f}, dry_run={self.dry_run}')
+        log.info('System online')
+        return True
+
+    def enqueue_bar(self, symbol, bar):
+        self.queue.put(('bar', symbol, bar))
+
+    def feed_dropped(self):
+        self.feed_ok = False
+        self.emit_alert('data_feed_down', 'Data feed unavailable; signals paused')
+        log.warning('Data feed dropped: signals paused; broker stops remain active')
+
+    def feed_recovered(self):
+        """Resume only after the stream owner confirms a healthy reconnection."""
+        self.feed_ok = True
+        log.info('Data feed recovered')
+
+    def check_breaker(self, execute=True):
+        self.risk.update_equity(self.portfolio.equity, self.now())
+        if self.portfolio.daily_pnl:
+            self.risk.day_start_equity = self.portfolio.equity - self.portfolio.daily_pnl
+        if self.portfolio.weekly_pnl:
+            self.risk.week_start_equity = self.portfolio.equity - self.portfolio.weekly_pnl
+        self.risk.evaluate_state(self.portfolio.equity, self.portfolio.positions,
+                                 self.last_regime.label if self.last_regime else None)
+        if self.risk.state != TradingState.NORMAL:
+            self.emit_alert('circuit_breaker', f'Trading state: {self.risk.state.value}', AlertSeverity.CRITICAL)
+        # These exits deliberately bypass entry vetoes (Step 5).
+        if execute and not self.stopping and self.risk.state in (TradingState.HALTED, TradingState.KILLED):
+            for symbol in self.portfolio.positions:
+                if not self.dry_run and symbol not in self.exit_pending:
+                    self.executor.close_position(symbol)
+                    self.exit_pending.add(symbol)
+        self.exit_pending.intersection_update(self.portfolio.positions)
+
+    def process_bar(self, symbol, bar):
+        if self.stopping:
+            return
+        stamp = pd.Timestamp(bar.name)
+        if symbol in self.bars and stamp <= self.bars[symbol].index[-1]:
+            return
+        previous = self.last_seen.get(symbol)
+        if previous is not None and self.now()-previous > timedelta(minutes=10):
+            self.feed_dropped()
+        self.last_seen[symbol] = self.now()
+        row = pd.DataFrame([bar.to_dict()], index=pd.DatetimeIndex([stamp]))
+        old = self.bars.get(symbol)
+        self.bars[symbol] = pd.concat([old, row]) if old is not None else row
+        self.bars[symbol] = self.bars[symbol].tail(2000)
+        self.counts['bars'] += 1
+        self.tracker.update_prices({symbol: float(bar['close'])})
+        allowed_before = self.entries_allowed()
+        self.check_breaker()
+        # Only predict once per completed universe bar; never use another symbol's future row.
+        ready = all(s in self.bars and self.bars[s].index[-1] >= stamp for s in self.symbols)
+        signals = []
+        history = {s: b.loc[:stamp] for s, b in self.bars.items()}
+        if ready and self.feed_ok and (self.last_prediction is None or stamp > self.last_prediction):
+            self.last_prediction = stamp
+            frame = self.features.build_features(history[self.symbols[0]])
+            if not frame.empty and frame.index[-1] == stamp:
+                # An HMM failure cannot partially advance the forward or stability filters.
+                backup = copy.deepcopy(self.engine)
+                try:
+                    previous_regime = self.last_regime
+                    self.last_regime = self.engine.update(frame.iloc[-1], stamp)
+                    self.status_call('record_regime', self.last_regime.label, self.last_regime.probability)
+                    if previous_regime is not None and previous_regime.label != self.last_regime.label:
+                        self.emit_alert('regime_change', f'{previous_regime.label} → {self.last_regime.label}', AlertSeverity.INFO)
+                    log_event(get_logger('regime'), 'Regime prediction', **self.monitoring_context())
+                    if self.engine.is_flickering():
+                        self.emit_alert('flicker_exceeded', 'Regime flicker threshold exceeded')
+                except Exception:
+                    self.engine = backup
+                    log.exception('HMM error: holding current regime')
+                if self.last_regime is not None:
+                    signals = self.strategy.generate_signals(self.symbols, history, self.last_regime,
+                                                              self.engine.is_flickering())
+            if self.feed_ok:
+                for proposed in signals:
+                    if not allowed_before or not self.entries_allowed():
+                        log.info('rejected %s: trading halted', proposed.symbol)
+                        self.counts['rejected'] += 1
+                        self.status_call('record_decision', proposed.symbol, 'rejected', 'trading halted', self.last_regime.label, self.last_regime.probability)
+                        self.intended_order(proposed, RiskDecision(False, rejection_reason='trading halted'))
+                        continue
+                    decision = self.risk.validate_signal(proposed, self.portfolio)
+                    status = ('modified' if decision.modifications else 'approved') if decision.approved else 'rejected'
+                    self.counts[status] += 1
+                    detail = decision.modifications or decision.rejection_reason or 'risk approved'
+                    self.status_call('record_decision', proposed.symbol, status, detail, self.last_regime.label, self.last_regime.probability)
+                    self.recent_signals.append(f'{self.now():%H:%M} │ {proposed.symbol} │ {status} │ {detail}')
+                    log_event(get_logger('trades'), 'Signal decision', symbol=proposed.symbol,
+                              status=status, detail=detail, **self.monitoring_context())
+                    self.target_weights.update(decision.adjusted_weights)
+                    log.info('%s %s: %s', status, proposed.symbol,
+                             decision.modifications or decision.rejection_reason or 'risk approved')
+                    self.intended_order(proposed, decision)
+                    if decision.approved and self.entries_allowed() and not self.dry_run:
+                        chosen = decision.modified_signal or proposed
+                        # Persist the consumed bar and duplicate guard before a broker
+                        # write: acceptance may precede a process kill or timeout.
+                        self.save_snapshot()
+                        self.executor.submit_order(chosen, risk_decision=decision)
+        # Stop candidates come from the current regime even while signals are paused/halted.
+        if self.last_regime is not None:
+            stop_signals = signals or self.strategy.generate_signals(list(history), history, self.last_regime,
+                                                                      self.engine.is_flickering())
+            for sig in stop_signals:
+                pos = self.tracker.positions.get(sig.symbol)
+                if pos and sig.stop_loss is not None and (pos.stop is None or
+                        (sig.stop_loss > pos.stop if pos.qty > 0 else sig.stop_loss < pos.stop)):
+                    if not self.dry_run and not self.stopping:
+                        self.executor.modify_stop(sig.symbol, sig.stop_loss)
+                        pos.stop = sig.stop_loss
+        self.check_breaker()
+        self.refresh()
+        if self.trained_at is not None and self.now() - self.trained_at > WEEK:
+            self.ensure_model()
+        self.save_snapshot()
+
+    def refresh(self):
+        base = self.portfolio.equity-self.portfolio.daily_pnl
+        threshold = self.config.get('monitoring', {}).get('large_pnl_fraction', .02)
+        if base > 0 and abs(self.portfolio.daily_pnl)/base >= threshold:
+            self.emit_alert('large_pnl', f'Daily P&L: {self.portfolio.daily_pnl:+.2f}')
+        log_event(get_logger('main'), 'Portfolio snapshot', **self.monitoring_context())
+        gross = sum(abs(p.get('market_value', 0)) for p in self.portfolio.positions.values())
+        state = DashboardState(
+            regime=self.last_regime.label if self.last_regime else 'unknown',
+            confidence=self.last_regime.probability if self.last_regime else 0,
+            equity=self.portfolio.equity, daily_pnl=self.portfolio.daily_pnl,
+            trading_state=self.risk.state.value,
+            stability=self.last_regime.consecutive_bars if self.last_regime else 0,
+            flicker=self.last_regime.flicker_rate if self.last_regime else 0,
+            flicker_window=self.config.get('hmm', {}).get('flicker_window', 20),
+            allocation=gross/self.portfolio.equity if self.portfolio.equity else 0,
+            leverage=gross/self.portfolio.equity if self.portfolio.equity else 0,
+            daily_drawdown=max(0, -self.portfolio.daily_pnl/base) if base > 0 else 0,
+            daily_limit=self.risk.config.daily_dd_halt, peak_limit=self.risk.config.max_dd_from_peak,
+            data_ok=self.feed_ok, api_ok=self.api_ok, api_latency_ms=self.api_latency_ms,
+            hmm_age_days=(self.now()-self.trained_at).total_seconds()/86400 if self.trained_at else None,
+            paper=self.config['broker'].get('paper_trading', True), recent_events=list(self.recent_signals),
+            drawdown=self.risk.drawdown_from_peak(self.portfolio.equity),
+            target_weights=dict(self.target_weights),
+            positions=[dict(symbol=s, **p) for s, p in self.portfolio.positions.items()])
+        self.dashboard.update(state)
+        try:
+            self._status_data = asdict(state)
+            self._status_data.update(running=self.online and not self.stopping, dry_run=self.dry_run,
+                                     counts=dict(self.counts), symbols=list(self.symbols), started_at=self.started_at,
+                                     positions=[dict(symbol=s, qty=p.get('qty', 0), market_value=p.get('market_value', 0))
+                                                for s, p in self.portfolio.positions.items()])
+            self._status_data.pop('recent_events', None)
+            self.status_call('update_status', self._status_data)
+        except Exception:
+            log.debug('Status snapshot failed')
+
+    def save_snapshot(self):
+        risk = {k: getattr(self.risk, k) for k in
+                ('peak_equity', 'day_start_equity', 'week_start_equity', 'trades_today',
+                 '_last_equity', '_acknowledged_peak', '_day', '_week')}
+        payload = dict(version=1, model_trained_at=self.trained_at, risk=risk,
+                       duplicates=[dict(symbol=s, direction=d.value, timestamp=t)
+                                   for (s, d), t in self.risk._duplicates.items()],
+                       breaker=sorted(self.risk.breaker.active), lock_written=self.risk.breaker._lock_written,
+                       state=self.risk.state.value,
+                       counts=self.counts, positions={s: vars(p).copy() for s, p in self.tracker.positions.items()})
+        if self.last_regime is not None:
+            payload['regime'] = asdict(self.last_regime)
+            payload['alpha'] = self.engine._log_alpha
+            payload['stability'] = vars(self.engine.stability)
+            payload['last_prediction'] = self.last_prediction
+        def encode(value):
+            if isinstance(value, (datetime, date, pd.Timestamp)):
+                return value.isoformat()
+            if isinstance(value, (np.ndarray, deque, tuple)):
+                return list(value)
+            if isinstance(value, np.generic):
+                return value.item()
+            raise TypeError(type(value).__name__)
+        self.snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.snapshot_path.with_suffix('.tmp')
+        temporary.write_text(json.dumps(payload, default=encode, indent=2))
+        temporary.replace(self.snapshot_path)
+
+    def restore_snapshot(self):
+        if not self.snapshot_path.exists():
+            return
+        data = json.loads(self.snapshot_path.read_text())
+        for key, value in data['risk'].items():
+            if key == '_day' and value:
+                value = date.fromisoformat(value)
+            if key == '_week' and value:
+                value = tuple(value)
+            setattr(self.risk, key, value)
+        self.risk.breaker.active.update(data['breaker'])
+        self.risk.breaker._lock_written = data.get('lock_written', False)
+        self.risk.state = TradingState(data['state'])
+        from core.regime_strategies import Direction
+        self.risk._duplicates = {
+            (item['symbol'], Direction(item['direction'])): datetime.fromisoformat(item['timestamp'])
+            for item in data.get('duplicates', [])
+        }
+        self.counts.update(data.get('counts', {}))
+        if self.risk._day == self.now().date() and self.risk.day_start_equity is not None:
+            self.portfolio.daily_pnl = self.portfolio.equity-self.risk.day_start_equity
+            self.portfolio.daily_trades = self.risk.trades_today
+        if self.risk._week == self.now().isocalendar()[:2] and self.risk.week_start_equity is not None:
+            self.portfolio.weekly_pnl = self.portfolio.equity-self.risk.week_start_equity
+        # Broker owns quantities/prices. Recover only metadata, never resurrect positions.
+        for symbol, saved in data.get('positions', {}).items():
+            pos = self.tracker.positions.get(symbol)
+            if pos:
+                for key in ('regime_at_entry', 'trade_id', 'current_regime'):
+                    setattr(pos, key, saved.get(key))
+                if saved.get('entry_time'):
+                    pos.entry_time = datetime.fromisoformat(saved['entry_time'])
+                # Broker stop is authoritative; a snapshot cannot claim an unplaced stop.
+        if data.get('regime') and self.trained_at is not None and data.get('model_trained_at') == self.trained_at.isoformat():
+            state = data['regime']
+            state['state_probabilities'] = np.asarray(state['state_probabilities'])
+            state['timestamp'] = pd.Timestamp(state['timestamp']) if state['timestamp'] else None
+            self.last_regime = RegimeState(**state)
+            self.engine._log_alpha = np.asarray(data['alpha']) if data['alpha'] is not None else None
+            for key, value in data['stability'].items():
+                if key == '_raw_history':
+                    value = deque(value, maxlen=self.engine.config.flicker_window + 1)
+                setattr(self.engine.stability, key, value)
+            self.engine._last_state = self.last_regime
+            self.last_prediction = pd.Timestamp(data['last_prediction']) if data['last_prediction'] else None
+        log.info('Recovered state snapshot')
+
+    def request_stop(self, signum=None, frame=None):
+        # Signal handlers only set flags; shutdown never calls any order interface.
+        self.stopping = True
+        self.running = False
+
+    def shutdown(self):
+        self.request_stop()
+        for close in reversed(self.started_resources):
+            try:
+                close()
+            except Exception:
+                log.exception('Error closing stream/dashboard')
+        self.started_resources.clear()
+        summary = f'Session summary: {self.counts}; equity={self.portfolio.equity:.2f}'
+        try:
+            self.save_snapshot()
+            self.output(summary)
+        finally:
+            self.status_call('update_status', dict(self._status_data, running=False, counts=dict(self.counts)), force=True)
+            self.status_call('record_event', 'stop', summary)
+            self.status_call('close')
+
+    def run(self, *, install_signals=True):
+        previous = {}
+        try:
+            if install_signals:
+                for sig in (signal.SIGINT, signal.SIGTERM):
+                    previous[sig] = signal.signal(sig, self.request_stop)
+            if not self.startup():
+                return
+            self.running = not self.stopping
+            while self.running:
+                try:
+                    _, symbol, bar = self.queue.get_nowait()
+                except Empty:
+                    clock = self.read(self.client.get_clock)
+                    if not clock['is_open']:
+                        self.market_closed(clock)
+                        break
+                    thread = getattr(self.feed, '_thread', None)
+                    stale = any(self.now()-self.last_seen.get(s, self.feed_started_at) > timedelta(minutes=10) for s in self.symbols)
+                    if (thread is not None and not thread.is_alive()) or stale:
+                        self.feed_dropped()
+                    self.refresh()
+                    self.sleep(1)
+                    continue
+                clock = self.read(self.client.get_clock)
+                if not clock['is_open']:
+                    self.market_closed(clock)
+                    break
+                self.process_bar(symbol, bar)
+        except InterruptedError as exc:
+            if not self.stopping:
+                self.status_call('record_event', 'error', f'{type(exc).__name__}: {exc}'[:500])
+                raise
+        except Exception as exc:
+            self.status_call('record_event', 'error', f'{type(exc).__name__}: {exc}'[:500])
+            log.exception('Unhandled trading loop exception')
+            try:
+                self.save_snapshot()
+            finally:
+                self.emit_alert('loop_error', 'Trading loop stopped', AlertSeverity.CRITICAL)
+            raise
+        finally:
+            try:
+                self.shutdown()
+            finally:
+                for sig, handler in previous.items():
+                    signal.signal(sig, handler)
