@@ -366,3 +366,55 @@ def test_market_closes_with_queued_bar(loop):
     assert loop.counts['bars'] == 0
     loop.executor.submit_order.assert_not_called()
     assert loop.snapshot_path.exists()
+
+
+def test_raising_status_store_cannot_interrupt_trading(loop):
+    class RaisingStore:
+        def __getattr__(self, name):
+            def fail(*args, **kwargs):
+                raise RuntimeError('monitor unavailable')
+            return fail
+    loop.status_store = RaisingStore()
+    loop.startup()
+    loop.process_bar('SPY', bar(loop))
+    loop.refresh()
+    assert loop.counts['bars'] == 1
+    assert sum(loop.counts[key] for key in ('approved', 'modified', 'rejected')) == 1
+    loop.shutdown()
+
+
+def test_status_snapshot_contains_only_public_position_fields(loop):
+    loop.status_store = MagicMock()
+    loop.portfolio.positions = {'SPY': dict(qty=2, market_value=200, entry_price=90, internal='private')}
+    loop.online = True
+    loop.refresh()
+    data = loop.status_store.update_status.call_args.args[0]
+    assert data['positions'] == [dict(symbol='SPY', qty=2, market_value=200)]
+    assert data['running'] is True
+    assert data['counts'] == loop.counts
+    assert data['started_at'] == loop.started_at
+    assert data['target_weights'] == loop.target_weights
+
+
+def test_status_events_and_final_counts(loop):
+    loop.status_store = MagicMock()
+    loop.client.get_clock.return_value = dict(is_open=False, next_open='tomorrow')
+    loop.run(install_signals=False)
+    events = loop.status_store.record_event.call_args_list
+    assert [call.args[0] for call in events] == ['start', 'market_closed', 'stop']
+    data = loop.status_store.update_status.call_args.args[0]
+    assert data['running'] is False
+    assert data['counts'] == loop.counts
+    assert loop.status_store.update_status.call_args.kwargs['force'] is True
+    loop.status_store.close.assert_called_once()
+
+
+@pytest.mark.parametrize('exception', [ValueError('bad input'), InterruptedError('unexpected interruption')])
+def test_unhandled_errors_record_status(loop, exception):
+    loop.status_store = MagicMock()
+    loop.client.connect.side_effect = exception
+    with pytest.raises(type(exception)):
+        loop.run(install_signals=False)
+    errors = [call.args for call in loop.status_store.record_event.call_args_list if call.args[0] == 'error']
+    assert errors == [('error', f'{type(exception).__name__}: {exception}')]
+    loop.status_store.close.assert_called_once()
