@@ -2,14 +2,27 @@
 from __future__ import annotations
 
 import inspect
+import os
 import re
 from threading import Thread
 
 import pandas as pd
+from alpaca.data.enums import DataFeed
 from alpaca.data.live import StockDataStream
 from alpaca.data.requests import (StockBarsRequest, StockLatestBarRequest,
                                  StockLatestQuoteRequest, StockSnapshotRequest)
 from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+
+def data_feed():
+    """Market data feed; IEX by default (free plan cannot query recent SIP)."""
+    value = (os.environ.get('ALPACA_DATA_FEED') or '').strip().lower()
+    if not value:
+        return DataFeed.IEX
+    try:
+        return DataFeed(value)
+    except ValueError as exc:
+        raise ValueError(f'Invalid ALPACA_DATA_FEED {value!r}; use iex or sip') from exc
 
 def plain(value):
     return value.model_dump(mode='python') if hasattr(value, 'model_dump') else value if isinstance(value, dict) else vars(value)
@@ -41,7 +54,8 @@ class MarketDataFeed:
 
     def _historical(self, symbols, period, start, end=None):
         response = self._data().get_stock_bars(StockBarsRequest(
-            symbol_or_symbols=symbols, timeframe=timeframe(period), start=start, end=end))
+            symbol_or_symbols=symbols, timeframe=timeframe(period), start=start, end=end,
+            feed=data_feed()))
         return response.df
 
     def get_historical_bars(self, symbol, timeframe, start, end=None):
@@ -65,18 +79,19 @@ class MarketDataFeed:
         return {s: b.tail(lookback) for s, b in self._bars.items()}
 
     def get_latest_bar(self, symbol):
-        return self._data().get_stock_latest_bar(StockLatestBarRequest(symbol_or_symbols=[symbol])).get(symbol)
+        return self._data().get_stock_latest_bar(StockLatestBarRequest(symbol_or_symbols=[symbol], feed=data_feed())).get(symbol)
 
     def get_latest_quote(self, symbol):
-        return self._data().get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[symbol])).get(symbol)
+        return self._data().get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=[symbol], feed=data_feed())).get(symbol)
 
     def get_snapshot(self, symbol):
-        return self._data().get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=[symbol])).get(symbol)
+        return self._data().get_stock_snapshot(StockSnapshotRequest(symbol_or_symbols=[symbol], feed=data_feed())).get(symbol)
 
     def _stream(self):
         self._data()
         if self.stream is None:
-            self.stream = StockDataStream(self.client._api_key, self.client._secret_key)
+            self.stream = StockDataStream(self.client._api_key, self.client._secret_key,
+                                          feed=data_feed())
         return self.stream
 
     def subscribe(self, callback):
