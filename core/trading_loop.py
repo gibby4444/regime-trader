@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import math
 import signal
 import time
 from collections import deque
@@ -19,7 +20,7 @@ import numpy as np
 import pandas as pd
 
 from core.hmm_engine import HMMEngine, RegimeState
-from core.risk_manager import PortfolioState, TradingState
+from core.risk_manager import PortfolioState, TradingState, RiskDecision
 from monitoring.dashboard import DashboardState
 from monitoring.status_store import NullStatusStore
 from monitoring.alerts import Alert, AlertSeverity
@@ -83,6 +84,31 @@ class TradingLoop:
             getattr(self.status_store, method)(*args, **kwargs)
         except Exception:
             log.debug('Monitoring update failed')
+
+    def intended_order(self, proposed, decision):
+        """Describe the desired delta using local state only; never veto trading."""
+        try:
+            chosen = decision.modified_signal or proposed
+            entry = chosen.entry_price
+            held = float(self.portfolio.positions.get(proposed.symbol, {}).get('qty', 0))
+            weight = proposed.metadata.get('target_weight', proposed.position_size_pct * proposed.leverage)
+            original = max(0, math.floor(weight * self.portfolio.equity / entry)) - held
+            final = decision.quantity - held if decision.approved else 0
+            if not original and not final and decision.approved:
+                return
+            side = 'buy' if (final or original) >= 0 else 'sell'
+            price = round(entry * (1.001 if side == 'buy' else .999), 2)
+            outcome = ('shrunk' if decision.modifications or abs(final) < abs(original) else 'approved') if decision.approved else 'rejected'
+            self.status_call('record_intended_order', symbol=proposed.symbol, side=side,
+                             original_qty=abs(original), final_qty=abs(final), price=price,
+                             order_type='limit', stop_price=chosen.stop_loss,
+                             notional=abs(final or original) * price,
+                             regime=self.last_regime.label, confidence=self.last_regime.probability,
+                             outcome=outcome, reason=str(decision.modifications or decision.rejection_reason or 'risk approved'),
+                             dry_run=self.dry_run,
+                             sent=bool(decision.approved and self.entries_allowed() and not self.dry_run))
+        except Exception:
+            log.debug('Intended order monitoring failed')
 
     def market_closed(self, clock):
         message = f"Market closed. Next open: {clock.get('next_open', 'unknown')}"
@@ -261,6 +287,7 @@ class TradingLoop:
                         log.info('rejected %s: trading halted', proposed.symbol)
                         self.counts['rejected'] += 1
                         self.status_call('record_decision', proposed.symbol, 'rejected', 'trading halted', self.last_regime.label, self.last_regime.probability)
+                        self.intended_order(proposed, RiskDecision(False, rejection_reason='trading halted'))
                         continue
                     decision = self.risk.validate_signal(proposed, self.portfolio)
                     status = ('modified' if decision.modifications else 'approved') if decision.approved else 'rejected'
@@ -273,6 +300,7 @@ class TradingLoop:
                     self.target_weights.update(decision.adjusted_weights)
                     log.info('%s %s: %s', status, proposed.symbol,
                              decision.modifications or decision.rejection_reason or 'risk approved')
+                    self.intended_order(proposed, decision)
                     if decision.approved and self.entries_allowed() and not self.dry_run:
                         chosen = decision.modified_signal or proposed
                         # Persist the consumed bar and duplicate guard before a broker

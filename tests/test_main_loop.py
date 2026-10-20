@@ -418,3 +418,56 @@ def test_unhandled_errors_record_status(loop, exception):
     errors = [call.args for call in loop.status_store.record_event.call_args_list if call.args[0] == 'error']
     assert errors == [('error', f'{type(exception).__name__}: {exception}')]
     loop.status_store.close.assert_called_once()
+
+
+@pytest.mark.parametrize('status,held,target,expected_side,original,final', [
+    ('approved', 0, 100, 'buy', 100, 100),
+    ('modified', 0, 40, 'buy', 100, 40),
+    ('rejected', 0, 0, 'buy', 100, 0),
+    ('approved', 150, 100, 'sell', 50, 50),
+])
+def test_dry_run_intended_orders(loop, status, held, target, expected_side, original, final):
+    loop.dry_run = True
+    loop.status_store = MagicMock()
+    loop.portfolio.positions = {'SPY': dict(qty=held, market_value=held * 100)}
+    proposed = loop.strategy.generate_signals.return_value[0]
+    changed = replace(proposed, position_size_pct=.04, stop_loss=96)
+    loop.risk.validate_signal = MagicMock(return_value=RiskDecision(
+        status != 'rejected', quantity=target,
+        modified_signal=changed if status == 'modified' else None,
+        modifications=['weight cap'] if status == 'modified' else [],
+        rejection_reason='spread' if status == 'rejected' else None))
+    loop.process_bar('SPY', bar(loop))
+    row = loop.status_store.record_intended_order.call_args.kwargs
+    assert row['side'] == expected_side
+    assert row['original_qty'] == original
+    assert row['final_qty'] == final
+    assert row['price'] == (100.1 if expected_side == 'buy' else 99.9)
+    assert row['stop_price'] == (96 if status == 'modified' else 95)
+    assert row['outcome'] == ('shrunk' if status == 'modified' else status)
+    assert row['notional'] == (final or original) * row['price']
+    assert row['dry_run'] and not row['sent']
+    loop.executor.submit_order.assert_not_called()
+
+
+def test_halted_intended_order(loop):
+    loop.dry_run = True
+    loop.status_store = MagicMock()
+    Path(loop.risk.config.lock_path).touch()
+    loop.process_bar('SPY', bar(loop))
+    row = loop.status_store.record_intended_order.call_args.kwargs
+    assert row['outcome'] == 'rejected'
+    assert row['reason'] == 'trading halted'
+    assert row['original_qty'] == 100
+    assert row['final_qty'] == 0
+    loop.executor.submit_order.assert_not_called()
+
+
+def test_intended_order_failure_is_harmless(loop):
+    loop.dry_run = True
+    loop.status_store = MagicMock()
+    loop.status_store.record_intended_order.side_effect = RuntimeError('unavailable')
+    loop.process_bar('SPY', bar(loop))
+    assert loop.counts['bars'] == 1
+    loop.status_store.record_intended_order.assert_called_once()
+    loop.executor.submit_order.assert_not_called()

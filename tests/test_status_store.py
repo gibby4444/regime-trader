@@ -12,6 +12,7 @@ def exercise(store):
     store.record_decision('SPY', 'approved', 'risk approved', 'bull', .9)
     store.record_regime('bull', .9)
     store.record_event('start', 'Started')
+    store.record_intended_order(symbol='SPY', side='buy', original_qty=10, final_qty=5, reason='cap')
 
 
 def test_disabled(monkeypatch):
@@ -91,12 +92,16 @@ def test_fake_connection_sql_and_cleanup(monkeypatch):
     store._stop.set()
     store._worker()
     sql = [call[0] for call in calls]
-    assert sum(s.startswith('CREATE TABLE IF NOT EXISTS') for s in sql) == 4
-    assert sum(s.startswith('DELETE FROM') for s in sql) == 3
+    assert sum(s.startswith('CREATE TABLE IF NOT EXISTS') for s in sql) == 5
+    assert sum(s.startswith('DELETE FROM') for s in sql) == 4
     assert any('ON CONFLICT (id)' in s for s in sql)
     assert any('INSERT INTO bot_decisions' in s for s in sql)
     assert any('INSERT INTO bot_regimes' in s for s in sql)
     assert any('INSERT INTO bot_events' in s for s in sql)
+    assert any('INSERT INTO bot_intended_orders' in s for s in sql)
+    assert any("DELETE FROM bot_intended_orders" in s for s in sql)
+    insert = next(call for call in calls if call[0].startswith('INSERT INTO bot_intended_orders'))
+    assert insert[1][:4] == ('SPY', 'buy', 10, 5)
     assert sql[-1] == 'CLOSE'
     assert store._queue.unfinished_tasks == 0
 
